@@ -54,10 +54,25 @@ def _prepare_timer_resolution() -> None:
         atexit.register(ctypes.windll.winmm.timeEndPeriod, 1)  # type: ignore[attr-defined]
 
 
+def _set_app_user_model_id() -> None:
+    """Give the process an explicit Windows AppUserModelID.
+
+    Without one, the taskbar groups/pins the window under pythonw.exe's
+    default identity and shows the Python icon instead of the window icon.
+    """
+    import ctypes
+
+    with contextlib.suppress(Exception):
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(  # type: ignore[attr-defined]
+            "tangjian-coder.vcplayer.1"
+        )
+
+
 def run(left: Path | None, right: Path | None) -> int:
     """Create the Qt application and enter the event loop."""
     _prepare_libmpv_path()
     _prepare_timer_resolution()
+    _set_app_user_model_id()
     sys.setswitchinterval(0.001)  # the lockstep worker is latency-sensitive
 
     from PySide6.QtCore import QTimer
