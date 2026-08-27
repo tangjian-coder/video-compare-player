@@ -49,6 +49,9 @@ class PlayerController:
         )
         self._meta: VideoMeta | None = None
         self._terminated = False
+        # Display rotation in degrees (0/90/180/270). Tracked locally:
+        # rotating through the property avoids round-trip reads entirely.
+        self._rotation = 0
 
     def _on_mpv_log(self, loglevel: str, component: str, message: str) -> None:
         """Forward mpv log messages to the logging module."""
@@ -150,6 +153,11 @@ class PlayerController:
         return float(2.0 ** float(self._mpv.video_zoom))
 
     @property
+    def rotation(self) -> int:
+        """Display rotation in degrees (0/90/180/270), clockwise."""
+        return self._rotation
+
+    @property
     def pan(self) -> tuple[float, float]:
         """Pan offset as fractions of the scaled video size (x, y)."""
         if self._terminated:
@@ -235,8 +243,24 @@ class PlayerController:
             self._mpv.video_pan_y = y
 
     def reset_view(self) -> None:
-        """Reset zoom and pan to defaults."""
+        """Reset zoom, pan and rotation to defaults."""
+        self._rotation = 0
+        if not self._terminated:
+            self._mpv.video_rotate = 0
         self.set_zoom(1.0)
+        self.set_pan(0.0, 0.0)
+
+    def rotate_cw(self) -> None:
+        """Rotate the display 90 degrees clockwise.
+
+        Pan resets to center: after a 90-degree turn the old pan position is
+        semantically meaningless, and a re-clamped holdover lands somewhere
+        unpredictable. Zoom survives unchanged.
+        """
+        if self._terminated:
+            return
+        self._rotation = (self._rotation + 90) % 360
+        self._mpv.video_rotate = self._rotation
         self.set_pan(0.0, 0.0)
 
     def terminate(self) -> None:

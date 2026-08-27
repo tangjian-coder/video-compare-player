@@ -157,6 +157,14 @@ class MainWindow(QMainWindow):
 
         self._wire_view(self.view_a, "a")
         self._wire_view(self.view_b, "b")
+        # Ctrl-modified gestures steer both surfaces together: each side
+        # converts zoom steps / pointer deltas with its own metrics.
+        self.view_a.surface.paired_zoom.connect(self.view_b.surface.apply_paired_zoom)
+        self.view_b.surface.paired_zoom.connect(self.view_a.surface.apply_paired_zoom)
+        self.view_a.surface.paired_pan.connect(self.view_b.surface.apply_paired_pan)
+        self.view_b.surface.paired_pan.connect(self.view_a.surface.apply_paired_pan)
+        self.view_a.surface.paired_reset.connect(self.view_b.surface.apply_paired_reset)
+        self.view_b.surface.paired_reset.connect(self.view_a.surface.apply_paired_reset)
         self.timeline.scrub_preview.connect(self._on_scrub_preview)
         self.timeline.seek_committed.connect(self._on_seek_committed)
 

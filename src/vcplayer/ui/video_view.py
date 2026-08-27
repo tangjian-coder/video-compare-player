@@ -74,12 +74,37 @@ def step_zoom(current: float, direction: int) -> float:
     return ZOOM_STEPS[idx]
 
 
+def pixels_to_pan_delta(dx: float, dy: float, disp_w: float, disp_h: float) -> tuple[float, float]:
+    """Convert pointer pixel deltas to mpv pan fractions.
+
+    mpv pans in fractions of the scaled video size, so the same pixel
+    distance is a larger fraction on a smaller display. Zero-sized
+    displays yield no movement.
+    """
+    if disp_w <= 0 or disp_h <= 0:
+        return 0.0, 0.0
+    return dx / disp_w, dy / disp_h
+
+
+def rotated_size(w: float, h: float, rotation: int) -> tuple[float, float]:
+    """Effective video dimensions after display rotation."""
+    return (h, w) if rotation % 180 else (w, h)
+
+
 class MpvSurface(QWidget):
     """Native render surface for libmpv; owns mouse input for zoom/pan."""
 
     clicked = Signal()
     file_dropped = Signal(str)
     zoom_changed = Signal(float)  # current linear zoom factor
+    # Gestures relay to the paired surface unless Ctrl is held: the default
+    # intent in a comparison tool is steering both views at once, Ctrl opts
+    # this side out. Zoom steps relay as a direction, pan as pointer pixel
+    # deltas (each side converts them with its own display size, keeping
+    # pointer movement 1:1 everywhere).
+    paired_zoom = Signal(int)
+    paired_pan = Signal(float, float)
+    paired_reset = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -90,7 +115,14 @@ class MpvSurface(QWidget):
         self._player: PlayerController | None = None
         self._drag_origin: tuple[float, float] | None = None
         self._pan_origin: tuple[float, float] = (0.0, 0.0)
+        # Last move-event position: paired pan relays per-event deltas.
+        self._last_move_pos: tuple[float, float] | None = None
         self._wheel_accum = 0  # high-res trackpads emit many small deltas
+
+    @property
+    def has_player(self) -> bool:
+        """True once ensure_player() has created the mpv instance."""
+        return self._player is not None
 
     @property
     def player(self) -> PlayerController:
@@ -114,15 +146,22 @@ class MpvSurface(QWidget):
     #   center itself; no manual compensation needed).
 
     def _display_size(self) -> tuple[float, float] | None:
-        """Displayed video size in pixels (aspect-fit * zoom); None unknown."""
+        """Displayed video size in pixels (aspect-fit * zoom); None unknown.
+
+        Rotation-aware: a 90/270-degree turn swaps the effective
+        dimensions before the aspect-fit, matching how mpv presents the
+        rotated frame. Pan limits and pixel->pan conversion both depend
+        on this.
+        """
         if self._player is None or self._player.meta is None:
             return None
         meta = self._player.meta
+        vw, vh = rotated_size(float(meta.width), float(meta.height), self._player.rotation)
         w, h = float(self.width()), float(self.height())
-        if meta.width <= 0 or meta.height <= 0 or w <= 0 or h <= 0:
+        if vw <= 0 or vh <= 0 or w <= 0 or h <= 0:
             return None
-        scale = min(w / meta.width, h / meta.height) * self._player.zoom
-        return meta.width * scale, meta.height * scale
+        scale = min(w / vw, h / vh) * self._player.zoom
+        return vw * scale, vh * scale
 
     def _pan_limits(self) -> tuple[float, float] | None:
         """Per-axis max |pan| that keeps a video edge at the window edge."""
@@ -144,8 +183,21 @@ class MpvSurface(QWidget):
         mx, my = limits
         return min(max(x, -mx), mx), min(max(y, -my), my)
 
+    def _step_zoom(self, direction: int) -> None:
+        """Advance this surface's zoom by one stop; re-clamp pan."""
+        assert self._player is not None
+        z0 = self._player.zoom
+        z1 = step_zoom(z0, direction)
+        if z1 == z0:
+            return
+        px0, py0 = self._player.pan
+        self._player.set_zoom(z1)
+        # Re-clamp: the allowed pan range shrinks when zooming out.
+        self._player.set_pan(*self._clamp_pan(px0, py0))
+        self.zoom_changed.emit(z1)
+
     def wheelEvent(self, event: QWheelEvent) -> None:
-        """Zoom by discrete stops, anchored on the window center."""
+        """Zoom by discrete stops; Ctrl+wheel zooms both views together."""
         if self._player is None:
             return
         # Accumulate deltas so high-resolution trackpads advance one stop
@@ -160,16 +212,32 @@ class MpvSurface(QWidget):
             self._wheel_accum += 120
         if direction == 0:
             return
-        z0 = self._player.zoom
-        z1 = step_zoom(z0, direction)
-        if z1 == z0:
-            return
-        px0, py0 = self._player.pan
-        self._player.set_zoom(z1)
-        # Re-clamp: the allowed pan range shrinks when zooming out.
-        self._player.set_pan(*self._clamp_pan(px0, py0))
-        self.zoom_changed.emit(z1)
+        self._step_zoom(direction)
+        if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self.paired_zoom.emit(direction)
         event.accept()
+
+    def apply_paired_zoom(self, direction: int) -> None:
+        """Handle a Ctrl+wheel step relayed from the other surface."""
+        if self._player is not None:
+            self._step_zoom(direction)
+
+    def apply_paired_pan(self, dx_px: float, dy_px: float) -> None:
+        """Handle a Ctrl+drag pan relayed from the other surface.
+
+        Converts the pointer's pixel delta with this surface's own
+        display size, so both views track the mouse 1:1 even at
+        different resolutions or zoom levels.
+        """
+        if self._player is None:
+            return
+        disp = self._display_size()
+        if disp is None:
+            return
+        x0, y0 = self._player.pan
+        fdx, fdy = pixels_to_pan_delta(dx_px, dy_px, disp[0], disp[1])
+        x, y = self._clamp_pan(x0 + fdx, y0 + fdy)
+        self._player.set_pan(x, y)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         """Record drag origin and mark this view as the active one."""
@@ -177,10 +245,16 @@ class MpvSurface(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and self._player is not None:
             self._drag_origin = (event.position().x(), event.position().y())
             self._pan_origin = self._player.pan
+            self._last_move_pos = self._drag_origin
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        """Pan the video 1:1 with the pointer while dragging."""
+        """Pan the video 1:1 with the pointer while dragging.
+
+        Ctrl+drag additionally relays the pointer's per-event pixel delta
+        to the paired surface (which converts it with its own display
+        size, keeping both views tracking the mouse).
+        """
         if self._drag_origin is None or self._player is None:
             return
         disp = self._display_size()
@@ -197,15 +271,28 @@ class MpvSurface(QWidget):
             # instead of having to unwind the blocked excess first.
             self._pan_origin = (x, y)
             self._drag_origin = (event.position().x(), event.position().y())
+        if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            last = self._last_move_pos or self._drag_origin
+            self.paired_pan.emit(event.position().x() - last[0], event.position().y() - last[1])
+        self._last_move_pos = (event.position().x(), event.position().y())
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         """End a pan drag."""
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_origin = None
+            self._last_move_pos = None
             self.unsetCursor()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        """Reset zoom and pan."""
+        """Reset zoom, pan and rotation; Ctrl limits the reset to this side."""
+        if self._player is not None:
+            self._player.reset_view()
+            self.zoom_changed.emit(1.0)
+            if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                self.paired_reset.emit()
+
+    def apply_paired_reset(self) -> None:
+        """Handle a double-click reset relayed from the other surface."""
         if self._player is not None:
             self._player.reset_view()
             self.zoom_changed.emit(1.0)
@@ -273,9 +360,16 @@ class VideoView(QFrame):
         self.btn_play = QPushButton("Play")
         self.btn_play.setObjectName("miniButton")
         self.btn_play.setToolTip(f"Play/pause {view_name} alone (for finding the sync frame)")
+        self.btn_rotate = QPushButton("↻")
+        self.btn_rotate.setObjectName("miniButton")
+        self.btn_rotate.setToolTip(
+            f"Rotate {view_name} 90° clockwise (double-click the video to reset)"
+        )
         self._zoom_label = QLabel("")
         self._zoom_label.setObjectName("zoomLabel")
-        self._zoom_label.setToolTip("Current zoom factor (double-click the video to reset)")
+        self._zoom_label.setToolTip(
+            "Current zoom factor / rotation (double-click the video to reset)"
+        )
         self._time_label = QLabel("--")
         self._time_label.setObjectName("timeLabel")
         footer = QHBoxLayout()
@@ -285,6 +379,7 @@ class VideoView(QFrame):
         footer.addWidget(self.btn_step_fwd)
         footer.addWidget(self.btn_play)
         footer.addStretch(1)
+        footer.addWidget(self.btn_rotate)
         footer.addWidget(self._zoom_label)
         footer.addWidget(self._time_label)
         footer.addStretch(1)
@@ -298,7 +393,27 @@ class VideoView(QFrame):
 
         self.surface.clicked.connect(lambda: self.clicked.emit(self.view_name))
         self.surface.file_dropped.connect(self.file_dropped)
-        self.surface.zoom_changed.connect(self._on_zoom_changed)
+        self.surface.zoom_changed.connect(lambda _z: self._refresh_view_label())
+        self.btn_rotate.clicked.connect(self._on_rotate)
+
+    def _on_rotate(self) -> None:
+        """Rotate this view 90° clockwise (pan recenters, zoom survives)."""
+        if self.surface.has_player:
+            self.surface.player.rotate_cw()
+            self._refresh_view_label()
+
+    def _refresh_view_label(self) -> None:
+        """Show zoom factor and rotation; empty when both are default."""
+        if not self.surface.has_player:
+            self._zoom_label.clear()
+            return
+        player = self.surface.player
+        parts: list[str] = []
+        if abs(player.zoom - 1.0) >= 0.005:
+            parts.append(f"×{player.zoom:.1f}")
+        if player.rotation:
+            parts.append(f"{player.rotation}°")
+        self._zoom_label.setText(" · ".join(parts))
 
     @property
     def player(self) -> PlayerController:
@@ -321,13 +436,6 @@ class VideoView(QFrame):
     def set_play_text(self, playing: bool) -> None:
         """Update the per-view play button label."""
         self.btn_play.setText("Pause" if playing else "Play")
-
-    def _on_zoom_changed(self, zoom: float) -> None:
-        """Show the zoom factor; hide the label when at unity."""
-        if abs(zoom - 1.0) < 0.005:
-            self._zoom_label.clear()
-        else:
-            self._zoom_label.setText(f"×{zoom:.1f}")
 
     # -- drag & drop on the container (placeholder state) -----------------------
 
