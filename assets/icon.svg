@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- video-compare-player app icon: dual video panes stepping toward sync -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a3a3c"/>
+      <stop offset="1" stop-color="#1c1c1e"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#bg)"/>
+  <!-- pane A (system blue) -->
+  <rect x="18" y="30" width="46" height="40" rx="8" fill="#0a84ff"/>
+  <!-- pane B (system green) -->
+  <rect x="64" y="44" width="46" height="40" rx="8" fill="#30d158" opacity="0.92"/>
+  <!-- step arrows pointing toward each other -->
+  <path d="M37 62 l18 0 m-9 -9 l0 18" stroke="#fff" stroke-width="3" stroke-linecap="round" fill="none"/>
+  <path d="M87 76 l-18 0 m9 9 l0 -18" stroke="#fff" stroke-width="3" stroke-linecap="round" fill="none"/>
+  <!-- sync anchor diamond (system yellow) -->
+  <circle cx="64" cy="60" r="10" fill="#ffd60a"/>
+  <circle cx="64" cy="60" r="4.5" fill="#1c1c1e"/>
+</svg>

@@ -7,10 +7,32 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import VENDOR_DIR, AppConfig
 
+if TYPE_CHECKING:
+    from PySide6.QtWidgets import QApplication
+
 logger = logging.getLogger(__name__)
+
+ICON_SIZES = (256, 128, 64, 48, 32, 16)
+
+
+def _apply_window_icon(app: QApplication) -> None:
+    """Set the app icon from assets/ (multi-resolution PNG bundle)."""
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QIcon
+
+    icon = QIcon()
+    for size in ICON_SIZES:
+        path = VENDOR_DIR.parent / "assets" / f"icon-{size}.png"
+        if path.is_file():
+            icon.addFile(str(path), QSize(size, size))
+    if not icon.isNull():
+        app.setWindowIcon(icon)
+    else:
+        logger.warning("no app icon files found under assets/")
 
 
 def _prepare_libmpv_path() -> None:
@@ -46,6 +68,7 @@ def run(left: Path | None, right: Path | None) -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("video-compare-player")
+    _apply_window_icon(app)
     apply_app_style(app)
 
     config = AppConfig.load()

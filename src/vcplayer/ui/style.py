@@ -1,130 +1,170 @@
-"""Application stylesheet (QSS), dark flat theme for video work."""
+"""Application stylesheet (QSS): macOS dark-mode theme.
+
+Palette follows Apple's dark-mode system colors (HFSA dark variants):
+    background layers  #1E1E20 / #2C2C2E / #161618
+    system blue        #0A84FF   (primary action, view A)
+    system green       #30D158   (view B, "synced" state)
+    indigo             #5E5CE6   (align action)
+    system orange      #FF9F0A   (zoom readout)
+    system yellow      #FFD60A   (sync anchor marker)
+    system red         #FF453A   (playhead)
+"""
 
 from PySide6.QtWidgets import QApplication
 
 APP_QSS = """
 * {
-    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
     font-size: 9pt;
 }
 QMainWindow, QWidget#centralContainer {
-    background: #232426;
+    background: #1e1e20;
 }
 QPushButton {
-    background: #3a3d41;
-    color: #e6e6e6;
-    border: 1px solid #4f5358;
-    border-radius: 4px;
-    padding: 6px 14px;
+    background: #2c2c2e;
+    color: #f2f2f7;
+    border: none;
+    border-radius: 6px;
+    padding: 5px 14px;
     min-width: 48px;
 }
 QPushButton:hover {
-    background: #4a6b8a;
-    border-color: #5b9bd5;
+    background: #48484a;
 }
 QPushButton:pressed {
-    background: #2f5f8f;
+    background: #3a3a3c;
 }
 QPushButton:disabled {
-    background: #2b2d30;
-    color: #666a6f;
-    border-color: #3a3d41;
+    background: #3a3a3c;
+    color: #636366;
 }
 QPushButton#playButton {
     min-width: 84px;
     font-weight: 600;
-    background: #2f5f8f;
-    border-color: #5b9bd5;
+    background: #0a84ff;
+    color: #ffffff;
 }
 QPushButton#playButton:hover {
-    background: #3a70a0;
+    background: #409cff;
+}
+QPushButton#playButton:pressed {
+    background: #0071e3;
+}
+QPushButton#playButton:disabled {
+    background: #3a3a3c;
+    color: #636366;
 }
 QPushButton#miniButton {
     min-width: 36px;
     padding: 3px 10px;
 }
-QPushButton#syncButton {
-    border-color: #8a6d3b;
-}
-QPushButton#syncButton:hover {
-    background: #6b5636;
-    border-color: #c8a24d;
+QPushButton#miniButton:hover {
+    background: #48484a;
 }
 QPushButton#alignButton {
     font-weight: 600;
-    background: #7a5c24;
-    border-color: #c8a24d;
+    background: #5e5ce6;
+    color: #ffffff;
 }
 QPushButton#alignButton:hover {
-    background: #93702f;
+    background: #7a78e8;
 }
-QLabel#syncChip {
-    border-radius: 4px;
-    padding: 3px 10px;
-    font-family: "Cascadia Mono", Consolas, monospace;
+QPushButton#alignButton:pressed {
+    background: #4c4ad0;
 }
-QLabel#syncChip[state="off"] {
-    background: #5c4322;
-    color: #e8c06a;
+QPushButton#syncButton {
+    background: #2c2c2e;
+    color: #f2f2f7;
 }
-QLabel#syncChip[state="on"] {
-    background: #1e4620;
-    color: #7ede84;
+QPushButton#syncButton:hover {
+    background: #48484a;
 }
 QComboBox {
-    background: #3a3d41;
-    color: #e6e6e6;
-    border: 1px solid #4f5358;
-    border-radius: 4px;
-    padding: 4px 8px;
+    background: #2c2c2e;
+    color: #f2f2f7;
+    border: none;
+    border-radius: 6px;
+    padding: 5px 10px;
+}
+QComboBox:hover {
+    background: #48484a;
 }
 QComboBox::drop-down {
     border: none;
     width: 18px;
 }
 QComboBox QAbstractItemView {
-    background: #2b2d30;
-    color: #e6e6e6;
-    selection-background-color: #2f5f8f;
+    background: #2c2c2e;
+    color: #f2f2f7;
+    selection-background-color: #0a84ff;
     outline: none;
+    border-radius: 6px;
+}
+QLabel#syncChip {
+    border-radius: 7px;
+    padding: 3px 10px;
+    font-family: "Cascadia Mono", Consolas, monospace;
+}
+QLabel#syncChip[state="off"] {
+    background: #3a2a12;
+    color: #ff9f0a;
+}
+QLabel#syncChip[state="on"] {
+    background: #1e4620;
+    color: #30d158;
 }
 QFrame#videoView {
-    background: #17181a;
-    border: 1px solid #43464a;
-    border-radius: 4px;
+    background: #161618;
+    border: 1px solid #2c2c2e;
+    border-radius: 8px;
 }
 QLabel#viewBadge {
-    background: #2f5f8f;
     color: #ffffff;
-    border-radius: 4px;
+    border-radius: 7px;
     padding: 2px 10px;
     font-weight: 700;
 }
+QLabel#viewBadgeA {
+    background: #0a84ff;
+}
+QLabel#viewBadgeB {
+    background: #30d158;
+}
 QLabel#captionLabel {
-    color: #9a9da1;
+    color: #98989d;
 }
 QLabel#placeholderLabel {
     color: #5c6166;
     font-size: 13pt;
 }
 QLabel#timeLabel {
-    color: #9a9da1;
+    color: #98989d;
     font-family: "Cascadia Mono", Consolas, monospace;
 }
 QLabel#zoomLabel {
-    color: #c8a24d;
+    color: #ff9f0a;
     font-family: "Cascadia Mono", Consolas, monospace;
 }
 QStatusBar {
-    background: #232426;
-    color: #9a9da1;
+    background: #1e1e20;
+    color: #98989d;
+}
+QStatusBar QLabel {
+    color: #98989d;
 }
 QSplitter::handle {
-    background: #17181a;
+    background: #1e1e20;
+}
+QToolTip {
+    background: #2c2c2e;
+    color: #f2f2f7;
+    border: 1px solid #48484a;
+    border-radius: 5px;
+    padding: 4px 8px;
 }
 """
 
 
 def apply_app_style(app: QApplication) -> None:
-    """Apply the dark flat stylesheet to the application."""
+    """Apply the macOS dark stylesheet to the application."""
     app.setStyleSheet(APP_QSS)

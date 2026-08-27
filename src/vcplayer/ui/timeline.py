@@ -92,11 +92,11 @@ class TimelineWidget(QWidget):
             self.seek_committed.emit(self._x_to_time(event.position().x()))
 
     def paintEvent(self, event: QPaintEvent) -> None:
-        """Paint background, ticks and the playhead."""
+        """Paint background, ticks and the playhead (macOS dark palette)."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
-        painter.fillRect(0, 0, w, h, QColor(30, 30, 30))
+        painter.fillRect(0, 0, w, h, QColor(0x1C, 0x1C, 0x1E))
         span = self._hi - self._lo
         if span > 0 and w > 0:
             px_per_sec = w / span
@@ -106,7 +106,7 @@ class TimelineWidget(QWidget):
                 (s for s in TICK_STEPS_S if s * px_per_sec >= MIN_TICK_PX),
                 TICK_STEPS_S[-1],
             )
-            painter.setPen(QPen(QColor(120, 120, 120)))
+            painter.setPen(QPen(QColor(0x8E, 0x8E, 0x93)))
             t = math.ceil(self._lo / step) * step
             while t <= self._hi:
                 x = int((t - self._lo) * px_per_sec)
@@ -115,17 +115,17 @@ class TimelineWidget(QWidget):
                 t += step
             # Frame ticks when there is enough horizontal room.
             if px_per_sec / self._fps >= 4.0:
-                painter.setPen(QPen(QColor(70, 70, 70)))
+                painter.setPen(QPen(QColor(0x48, 0x48, 0x4A)))
                 frame = int(self._lo * self._fps)
                 while frame / self._fps <= self._hi:
                     x = int((frame / self._fps - self._lo) * px_per_sec)
                     painter.drawLine(x, h - 6, x, h)
                     frame += 1
-            # Sync-point marker: gold diamond + stem at the anchor frame.
+            # Sync-point marker: system-yellow diamond + stem at the anchor.
             if self._marker is not None and self._lo <= self._marker <= self._hi:
                 mx = (self._marker - self._lo) * px_per_sec
-                painter.setPen(QPen(QColor(230, 180, 60), 2))
-                painter.setBrush(QColor(230, 180, 60))
+                painter.setPen(QPen(QColor(0xFF, 0xD6, 0x0A), 2))
+                painter.setBrush(QColor(0xFF, 0xD6, 0x0A))
                 painter.drawLine(QPointF(mx, h - 12.0), QPointF(mx, float(h)))
                 painter.drawPolygon(
                     [
@@ -139,6 +139,6 @@ class TimelineWidget(QWidget):
             # Playhead (float coords + antialiasing for smooth motion);
             # clamped so an out-of-range time keeps the head visible.
             px = min(max((self._time - self._lo) * px_per_sec, 0.0), float(w))
-            painter.setPen(QPen(QColor(255, 80, 80), 2))
+            painter.setPen(QPen(QColor(0xFF, 0x45, 0x3A), 2))
             painter.drawLine(QPointF(px, 0.0), QPointF(px, float(h)))
         painter.end()

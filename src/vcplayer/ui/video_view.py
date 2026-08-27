@@ -247,7 +247,8 @@ class VideoView(QFrame):
         self.setAcceptDrops(True)  # catches drops while the placeholder is showing
 
         self._badge = QLabel(view_name)
-        self._badge.setObjectName("viewBadge")
+        # Distinct object names give A/B badges their system-blue/green fills.
+        self._badge.setObjectName(f"viewBadge{view_name}")
         self._caption = QLabel("no video")
         self._caption.setObjectName("captionLabel")
         header = QHBoxLayout()
