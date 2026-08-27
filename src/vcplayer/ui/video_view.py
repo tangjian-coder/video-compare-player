@@ -363,13 +363,12 @@ class VideoView(QFrame):
         self.btn_rotate = QPushButton("↻")
         self.btn_rotate.setObjectName("miniButton")
         self.btn_rotate.setToolTip(
-            f"Rotate {view_name} 90° clockwise (double-click the video to reset)"
+            f"Rotate {view_name} 90° clockwise (current angle on the button;"
+            " double-click the video to reset)"
         )
         self._zoom_label = QLabel("")
         self._zoom_label.setObjectName("zoomLabel")
-        self._zoom_label.setToolTip(
-            "Current zoom factor / rotation (double-click the video to reset)"
-        )
+        self._zoom_label.setToolTip("Current zoom factor (double-click the video to reset)")
         self._time_label = QLabel("--")
         self._time_label.setObjectName("timeLabel")
         footer = QHBoxLayout()
@@ -378,8 +377,8 @@ class VideoView(QFrame):
         footer.addWidget(self.btn_step_back)
         footer.addWidget(self.btn_step_fwd)
         footer.addWidget(self.btn_play)
-        footer.addStretch(1)
         footer.addWidget(self.btn_rotate)
+        footer.addStretch(1)
         footer.addWidget(self._zoom_label)
         footer.addWidget(self._time_label)
         footer.addStretch(1)
@@ -393,27 +392,25 @@ class VideoView(QFrame):
 
         self.surface.clicked.connect(lambda: self.clicked.emit(self.view_name))
         self.surface.file_dropped.connect(self.file_dropped)
-        self.surface.zoom_changed.connect(lambda _z: self._refresh_view_label())
+        # zoom_changed also fires on resets, which clear rotation too.
+        self.surface.zoom_changed.connect(lambda _z: self._refresh_view_state())
         self.btn_rotate.clicked.connect(self._on_rotate)
 
     def _on_rotate(self) -> None:
         """Rotate this view 90° clockwise (pan recenters, zoom survives)."""
         if self.surface.has_player:
             self.surface.player.rotate_cw()
-            self._refresh_view_label()
+        self._refresh_view_state()
 
-    def _refresh_view_label(self) -> None:
-        """Show zoom factor and rotation; empty when both are default."""
+    def _refresh_view_state(self) -> None:
+        """Sync the zoom readout and the rotate button's angle text."""
         if not self.surface.has_player:
             self._zoom_label.clear()
+            self.btn_rotate.setText("↻")
             return
         player = self.surface.player
-        parts: list[str] = []
-        if abs(player.zoom - 1.0) >= 0.005:
-            parts.append(f"×{player.zoom:.1f}")
-        if player.rotation:
-            parts.append(f"{player.rotation}°")
-        self._zoom_label.setText(" · ".join(parts))
+        self._zoom_label.setText(f"×{player.zoom:.1f}" if abs(player.zoom - 1.0) >= 0.005 else "")
+        self.btn_rotate.setText(f"↻ {player.rotation}°" if player.rotation else "↻")
 
     @property
     def player(self) -> PlayerController:
