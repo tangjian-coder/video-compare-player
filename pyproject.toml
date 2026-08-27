@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vcplayer"
+version = "0.1.0"
+description = "Dual-video synchronized comparison player (libmpv + PySide6)"
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6>=6.7,<7",
+    "python-mpv>=1.0,<2",
+]
+
+[project.gui-scripts]
+vcplayer = "vcplayer.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", "vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "PTH", "SIM", "RET"]
+
+[tool.mypy]
+mypy_path = "src"
+packages = ["vcplayer"]
+python_version = "3.12"
+disallow_untyped_defs = true
+ignore_missing_imports = true
+exclude = ["tests/", ".venv/", "vendor/"]

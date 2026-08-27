@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Runtime state
+logs/
+configs/settings.json
+
+# Vendored libmpv (112 MB DLL; fetch from the link in README.md)
+vendor/
