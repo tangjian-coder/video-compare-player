@@ -160,6 +160,47 @@ def test_force_resync_raises_when_unloaded() -> None:
         eng.force_resync()
 
 
+# -- resync_if_needed ---------------------------------------------------------
+
+
+def test_resync_if_needed_within_gate_does_not_seek() -> None:
+    # Gate is 1.2 frames of reference fps 100 = 12ms; 8ms stays under.
+    eng, a, b = make_engine()
+    a.time_pos, b.time_pos = 5.0, 5.008
+    assert eng.resync_if_needed() is False
+    assert b.seeks == []
+
+
+def test_resync_if_needed_beyond_gate_seeks() -> None:
+    eng, a, b = make_engine()
+    a.time_pos, b.time_pos = 5.0, 5.05  # 50ms > 12ms gate
+    assert eng.resync_if_needed() is True
+    assert b.seeks[-1] == pytest.approx(5.0)
+
+
+def test_resync_if_needed_none_when_unloaded() -> None:
+    eng, a, b = make_engine()
+    a.time_pos = None
+    assert eng.resync_if_needed() is False
+    assert b.seeks == []
+
+
+def test_resync_if_needed_seeks_through_offset_basis() -> None:
+    eng, a, b = make_engine(offset_a=2.0, offset_b=5.0)  # offset +3
+    a.time_pos, b.time_pos = 4.0, 7.04  # 40ms drift through the offset
+    assert eng.resync_if_needed() is True
+    assert b.seeks[-1] == pytest.approx(7.0)  # 4.0 + offset 3.0
+
+
+def test_resync_if_needed_uses_reference_fps_gate() -> None:
+    # A at 25fps -> gate 48ms; a 30ms drift seeks at 100fps but not here.
+    eng, a, b = make_engine()
+    a.fps = 25.0
+    a.time_pos, b.time_pos = 5.0, 5.03
+    assert eng.resync_if_needed() is False
+    assert b.seeks == []
+
+
 def test_view_time_mapping() -> None:
     eng, _, _ = make_engine(offset_a=2.0, offset_b=5.0)
     assert eng.view_time("a", 1.0) == 1.0

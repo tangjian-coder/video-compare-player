@@ -313,11 +313,13 @@ class MainWindow(QMainWindow):
                 eng.seek_master(lo)
         except SyncError:
             pass  # A is mid-load (no time yet): start from wherever it is
-        # When synced, snap B onto A's aligned position before starting so
-        # synchronized playback begins exactly aligned (any manual offset
-        # left from sync-point hunting is removed here).
+        # When synced, snap B onto A's aligned position before starting —
+        # but only when meaningfully off. An unconditional seek restarts
+        # B's decode pipeline (keyframe backstep plus decode forward) and
+        # visibly stalls B while A already plays; sub-frame residuals are
+        # converged by the regulate() speed loop instead.
         if eng.state.is_complete:
-            eng.force_resync()
+            eng.resync_if_needed()
         pa.play()
         pb.play()
         self._playing = True
@@ -334,17 +336,18 @@ class MainWindow(QMainWindow):
             logger.debug("playback stopped")
 
     def _resync_if_needed(self) -> None:
-        """Snap B onto A's aligned time if off by more than one frame."""
-        if self._closing:
+        """Snap B onto A's aligned time if off by more than ~one frame."""
+        # Runs from a delayed timer after pausing: skip when playback
+        # restarted in the meantime — a mid-playback hard seek is exactly
+        # what the free-run design avoids.
+        if self._closing or self._playing:
             return
         eng = self.engine
         # Without sync points there is no aligned position to restore:
         # leave manually offset views alone (sync-point hunting workflow).
         if eng is None or not eng.ready or not eng.state.is_complete:
             return
-        drift = eng.drift()
-        if drift is not None and abs(drift) > 1.2 / eng.reference_fps:
-            eng.force_resync()
+        eng.resync_if_needed()
 
     def _step(self, frames: int) -> None:
         eng = self._require_engine()

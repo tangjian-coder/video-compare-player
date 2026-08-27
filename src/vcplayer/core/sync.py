@@ -24,6 +24,10 @@ _MAX_NUDGE = 0.10  # speed correction limit (+/- 10%)
 _FULL_NUDGE_DRIFT = 0.03  # drift (s) that saturates the nudge
 _SPEED_WRITE_EPS = 0.005  # minimum meaningful speed change to write
 
+# resync_if_needed() gate: drift beyond this many reference frames gets a
+# corrective seek; smaller residuals are converged by the speed loop.
+_RESYNC_DRIFT_FRAMES = 1.2
+
 
 class SyncError(RuntimeError):
     """Raised when time information is unavailable (no file loaded)."""
@@ -153,6 +157,21 @@ class SyncEngine:
             target = min(max(target, 0.0), dur_b)
         self.b.seek_exact(target)
         logger.info("force resync: b -> %.3f (offset %+.3f)", target, self.offset)
+
+    def resync_if_needed(self) -> bool:
+        """Hard-align B onto A only when drift exceeds the frame gate.
+
+        Returns True when a corrective seek was issued. An unconditional
+        seek restarts B's decode pipeline (keyframe backstep plus decode
+        forward), stalling B for hundreds of ms on long-GOP sources while
+        A already plays — so seek only when meaningfully misaligned and
+        leave sub-frame residuals to regulate()'s speed loop.
+        """
+        drift = self.drift()
+        if drift is None or abs(drift) <= _RESYNC_DRIFT_FRAMES / self.reference_fps:
+            return False
+        self.force_resync()
+        return True
 
     def step(self, frames: int) -> float:
         """Pause and step both views by N reference frames; returns new master."""
