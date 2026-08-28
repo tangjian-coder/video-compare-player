@@ -366,7 +366,10 @@ class VideoView(QFrame):
             f"Rotate {view_name} 90° clockwise (current angle on the button;"
             " double-click the video to reset)"
         )
-        self._zoom_label = QLabel("")
+        # Default text matches the always-rendered design (see
+        # _on_zoom_changed): empty here would leave the footer without a
+        # readout until the first wheel event.
+        self._zoom_label = QLabel("×1.0")
         self._zoom_label.setObjectName("zoomLabel")
         self._zoom_label.setToolTip("Current zoom factor (double-click the video to reset)")
         self._time_label = QLabel("--")
@@ -400,8 +403,15 @@ class VideoView(QFrame):
         self.btn_rotate.clicked.connect(self._on_rotate)
 
     def _on_zoom_changed(self, zoom: float) -> None:
-        """Show the zoom factor; hide the label at unity."""
-        self._zoom_label.setText(f"×{zoom:.1f}" if abs(zoom - 1.0) >= 0.005 else "")
+        """Show the zoom factor.
+
+        Always rendered, including x1.0: every stop formats to the same
+        4 characters, so the label width never changes. A collapsing
+        (hidden-at-unity) label shifts the footer layout and, with the
+        embedded mpv native child present, the vacated pixels are not
+        reliably repainted - leaving stale text on screen.
+        """
+        self._zoom_label.setText(f"×{zoom:.1f}")
         # Resets clear rotation too; wheel steps never change it but the
         # extra read is a cheap local attribute, not an mpv round-trip.
         self._set_rotate_text()
