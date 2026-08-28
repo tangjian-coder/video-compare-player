@@ -132,8 +132,7 @@ class MainWindow(QMainWindow):
         # clobbered by the 15 ms UI tick.
         self._status_live = QLabel("")
         self.statusBar().addPermanentWidget(self._status_live)
-        self._timeline_range: tuple[float, float] | None = None
-        self._timeline_fps: float | None = None
+        self._timeline_durs: tuple[float | None, float | None] | None = None
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._on_ui_tick)
@@ -279,15 +278,14 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "open failed", f"Timed out loading:\n{path}")
 
-        if self.engine is not None and self.engine.ready:
-            lo, hi = self.engine.master_range()
-            if (lo, hi) != self._timeline_range:
-                self._timeline_range = (lo, hi)
-                self.timeline.set_range(lo, hi)
-            fps = self.engine.reference_fps
-            if fps != self._timeline_fps:
-                self._timeline_fps = fps
-                self.timeline.set_fps(fps)
+        # Push per-side durations without waiting for engine.ready: with
+        # only one side loaded the other renders as a dead track, and the
+        # loaded side already shows its real extent.
+        if self.engine is not None:
+            durs = (self.view_a.player.duration, self.view_b.player.duration)
+            if durs != self._timeline_durs:
+                self._timeline_durs = durs
+                self.timeline.set_durations(*durs)
 
     # -- transport ------------------------------------------------------------------
 
@@ -440,11 +438,11 @@ class MainWindow(QMainWindow):
         try:
             offset = eng.sync_here()
         except SyncError as exc:
+            logger.warning("align failed: %s", exc)
             self.statusBar().showMessage(f"Cannot sync: {exc}")
             return
         lo, hi = eng.master_range()
-        self.timeline.set_range(lo, hi)
-        self.timeline.set_marker(eng.state.point_a)
+        self.timeline.set_anchors(eng.state.point_a, eng.state.point_b)
         eng.seek_master(min(max(eng.master_time(), lo), hi))
         self._set_sync_chip(offset)
         self.statusBar().showMessage(f"Synced: offset = {offset:+.3f}s")
@@ -466,10 +464,7 @@ class MainWindow(QMainWindow):
             return
         self._stop_playback()
         self.engine.clear_sync()
-        if self.engine.ready:
-            lo, hi = self.engine.master_range()
-            self.timeline.set_range(lo, hi)
-        self.timeline.set_marker(None)
+        self.timeline.set_anchors(None, None)
         self._set_sync_chip(None)
         self.statusBar().showMessage("Sync cleared")
 
@@ -496,13 +491,27 @@ class MainWindow(QMainWindow):
             master = self.engine.master_time()
         except SyncError:
             return  # view A not loaded yet
-        if self._playing:
+        # Follow each player's real state, not the global sync flag: a
+        # solo-playing view must animate its own track.
+        a_playing = self.view_a.player.is_playing
+        if a_playing:
             # playback-time is clock-interpolated: smoother than time_pos.
             pt = self.view_a.player.playback_time
             if pt is not None:
                 master = pt
-        shown = self._smooth_playhead(master, self._playing)
-        self.timeline.set_time(shown)
+        shown = self._smooth_playhead(master, a_playing)
+        # Each knob shows its own video's actual local time (so solo
+        # playback moves only that track); the mapped position is a
+        # fallback while B is mid-load and reports no time yet.
+        t_b = self.view_b.player.playback_time
+        if t_b is None:
+            t_b = self.view_b.player.time_pos
+        if t_b is None:
+            t_b = self.engine.view_time("b", shown)
+        dur_b = self.view_b.player.duration
+        if dur_b is not None:
+            t_b = min(t_b, dur_b)
+        self.timeline.set_playheads(shown, t_b)
         self._update_view_time(self.view_a)
         self._update_view_time(self.view_b)
         self.view_a.set_play_text(self.view_a.player.is_playing)
@@ -524,9 +533,13 @@ class MainWindow(QMainWindow):
             self._playhead_mono = now
             return raw
         est = self._playhead_anchor + (now - self._playhead_mono) * self.config.speed
-        if self.engine is not None and self.engine.ready:
-            lo, hi = self.engine.master_range()
-            est = min(max(est, lo), hi)
+        # Clamp to A's own extent: the A track spans the full video, so a
+        # solo-playing A past the sync overlap must keep moving its knob
+        # (clamping to master_range would freeze it mid-track while the
+        # status bar keeps counting).
+        dur_a = self.view_a.player.duration
+        if dur_a is not None:
+            est = min(max(est, 0.0), dur_a)
         return est
 
     @staticmethod
