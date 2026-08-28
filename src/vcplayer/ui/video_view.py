@@ -380,6 +380,7 @@ class VideoView(QFrame):
         footer.addWidget(self.btn_rotate)
         footer.addStretch(1)
         footer.addWidget(self._zoom_label)
+        footer.addSpacing(16)  # keep the zoom readout clear of the time text
         footer.addWidget(self._time_label)
         footer.addStretch(1)
 
@@ -392,25 +393,30 @@ class VideoView(QFrame):
 
         self.surface.clicked.connect(lambda: self.clicked.emit(self.view_name))
         self.surface.file_dropped.connect(self.file_dropped)
-        # zoom_changed also fires on resets, which clear rotation too.
-        self.surface.zoom_changed.connect(lambda _z: self._refresh_view_state())
+        # The signal carries the just-written zoom value: display that
+        # directly instead of re-reading the mpv property (a round-trip
+        # that can serve a stale value inside the slot call chain).
+        self.surface.zoom_changed.connect(self._on_zoom_changed)
         self.btn_rotate.clicked.connect(self._on_rotate)
+
+    def _on_zoom_changed(self, zoom: float) -> None:
+        """Show the zoom factor; hide the label at unity."""
+        self._zoom_label.setText(f"×{zoom:.1f}" if abs(zoom - 1.0) >= 0.005 else "")
+        # Resets clear rotation too; wheel steps never change it but the
+        # extra read is a cheap local attribute, not an mpv round-trip.
+        self._set_rotate_text()
 
     def _on_rotate(self) -> None:
         """Rotate this view 90° clockwise (pan recenters, zoom survives)."""
         if self.surface.has_player:
             self.surface.player.rotate_cw()
-        self._refresh_view_state()
+        self._set_rotate_text()
 
-    def _refresh_view_state(self) -> None:
-        """Sync the zoom readout and the rotate button's angle text."""
-        if not self.surface.has_player:
-            self._zoom_label.clear()
-            self.btn_rotate.setText("↻")
-            return
-        player = self.surface.player
-        self._zoom_label.setText(f"×{player.zoom:.1f}" if abs(player.zoom - 1.0) >= 0.005 else "")
-        self.btn_rotate.setText(f"↻ {player.rotation}°" if player.rotation else "↻")
+    def _set_rotate_text(self) -> None:
+        """Show the current angle on the rotate button (local state only)."""
+        player = self.surface.player if self.surface.has_player else None
+        rotation = player.rotation if player is not None else 0
+        self.btn_rotate.setText(f"↻ {rotation}°" if rotation else "↻")
 
     @property
     def player(self) -> PlayerController:
