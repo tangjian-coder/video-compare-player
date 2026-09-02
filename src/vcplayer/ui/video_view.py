@@ -111,6 +111,11 @@ class MpvSurface(QWidget):
         self.setMinimumSize(400, 260)
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
+        # Never take keyboard focus: this is a native child window, and
+        # once focused it swallows keystrokes before Qt can route them,
+        # killing every QShortcut (Space / arrows / S / R / F9). Mouse
+        # interaction is unaffected by focus policy.
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setAcceptDrops(True)
         self._player: PlayerController | None = None
         self._drag_origin: tuple[float, float] | None = None

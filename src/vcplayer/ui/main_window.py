@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtGui import QCloseEvent, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -29,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import AppConfig
+from ..core import recorder as rec
 from ..core.player import PlayerController, PlayerError
 from ..core.sync import SyncEngine, SyncError, ViewId
 from .timeline import TimelineWidget
@@ -54,11 +57,11 @@ class MainWindow(QMainWindow):
 
         self.view_a = VideoView("A")
         self.view_b = VideoView("B")
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.view_a)
-        splitter.addWidget(self.view_b)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.addWidget(self.view_a)
+        self.splitter.addWidget(self.view_b)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 1)
 
         self.timeline = TimelineWidget()
 
@@ -87,6 +90,12 @@ class MainWindow(QMainWindow):
         self.sync_chip.setProperty("state", "off")
         self.btn_sync_clear = QPushButton("Clear sync")
         self.btn_sync_clear.setObjectName("syncButton")
+        self.btn_rec = QPushButton("⏺ Rec")
+        self.btn_rec.setObjectName("recButton")
+        self.btn_rec.setToolTip(
+            "Record the two video views to an mp4 clip. (F9)\n"
+            "Do not move or resize the window while recording."
+        )
 
         transport = QHBoxLayout()
         transport.addStretch(1)
@@ -106,6 +115,8 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.sync_chip)
         transport.addSpacing(12)
         transport.addWidget(self.btn_sync_clear)
+        transport.addSpacing(12)
+        transport.addWidget(self.btn_rec)
         transport.addStretch(1)
 
         central = QWidget()
@@ -113,7 +124,7 @@ class MainWindow(QMainWindow):
         vbox = QVBoxLayout(central)
         vbox.setContentsMargins(8, 8, 8, 8)
         vbox.setSpacing(8)
-        vbox.addWidget(splitter, stretch=1)
+        vbox.addWidget(self.splitter, stretch=1)
         vbox.addWidget(self.timeline)
         vbox.addLayout(transport)
         self.setCentralWidget(central)
@@ -133,6 +144,9 @@ class MainWindow(QMainWindow):
         self._status_live = QLabel("")
         self.statusBar().addPermanentWidget(self._status_live)
         self._timeline_durs: tuple[float | None, float | None] | None = None
+        # Screen recorder session (created on first F9/Rec click).
+        self._recorder: rec.ScreenRecorder | None = None
+        self._rec_secs = -1  # last elapsed second shown on the button
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._on_ui_tick)
@@ -177,6 +191,7 @@ class MainWindow(QMainWindow):
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         self.btn_align.clicked.connect(self._align_current_frames)
         self.btn_sync_clear.clicked.connect(self._clear_sync)
+        self.btn_rec.clicked.connect(self._toggle_record)
 
         self._add_shortcut(Qt.Key.Key_Space, self._toggle_play)
         self._add_shortcut(Qt.Key.Key_Left, lambda: self._step(-1))
@@ -187,6 +202,7 @@ class MainWindow(QMainWindow):
         self._add_shortcut(Qt.Key.Key_End, self._goto_last)
         self._add_shortcut(Qt.Key.Key_S, self._align_current_frames)
         self._add_shortcut(Qt.Key.Key_R, self._clear_sync)
+        self._add_shortcut(Qt.Key.Key_F9, self._toggle_record)
         self._add_shortcut(QKeySequence.StandardKey.Open, self._open_active)
 
         self._ui_timer.start(UI_TICK_MS)
@@ -224,6 +240,8 @@ class MainWindow(QMainWindow):
         self._drift_timer.stop()
         self._load_timer.stop()
         self._playing = False  # stop playback
+        if self._recorder is not None:
+            self._recorder.terminate()  # finalize the mp4 before we die
         self.config.window.width = self.width()
         self.config.window.height = self.height()
         self.config.save()
@@ -468,6 +486,108 @@ class MainWindow(QMainWindow):
         self._set_sync_chip(None)
         self.statusBar().showMessage("Sync cleared")
 
+    # -- recording ------------------------------------------------------------------
+
+    def _toggle_record(self) -> None:
+        """F9 / Rec button: start recording, or stop when one is running."""
+        if self._recorder is not None and self._recorder.recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self) -> None:
+        """Probe ffmpeg and launch a capture of the views' screen region."""
+        ffmpeg = rec.locate_ffmpeg()
+        if ffmpeg is None:
+            self.statusBar().showMessage("Recording unavailable: ffmpeg not found")
+            return
+        support = rec.probe_capabilities(ffmpeg)
+        if support is None:
+            self.statusBar().showMessage("Recording unavailable: no capture pipeline")
+            return
+        if self.isMinimized():
+            self.statusBar().showMessage("Restore the window before recording")
+            return
+        region = rec.physical_region(self.splitter)
+        screens = rec.screen_physical_rects()
+        primary = QGuiApplication.primaryScreen()
+        pg = primary.geometry()
+        pdpr = primary.devicePixelRatio()
+        prect = (pg.x(), pg.y(), round(pg.width() * pdpr), round(pg.height() * pdpr))
+        # ddagrab addresses the primary display only (DDA output 0):
+        # the region must sit fully inside the primary screen's physical
+        # rect; off-primary needs the gdigrab pipeline, if this ffmpeg
+        # build has one at all.
+        profile = support.primary
+        if profile.capture == "ddagrab" and not rec.region_within(region, prect):
+            if support.off_primary is None:
+                self.statusBar().showMessage("Move the window to the primary screen to record")
+                return
+            profile = support.off_primary
+        # Reject regions with corners off the virtual desktop (window
+        # half off-screen, parked at -32000, ...): ffmpeg cannot capture.
+        if not rec.region_fully_on_screens(region, screens):
+            self.statusBar().showMessage(
+                "Recording region is off-screen; move the window fully onto a screen"
+            )
+            return
+        out = rec.unique_output_path(rec.default_output_dir(), rec.output_timestamp())
+        try:
+            recorder = self._recorder
+            if recorder is None:
+                recorder = rec.ScreenRecorder(ffmpeg, profile, self)
+                recorder.stateChanged.connect(self._on_rec_state)
+                recorder.error.connect(self._on_rec_error)
+                recorder.saved.connect(self._on_rec_saved)
+                # Assign before start(): the "recording" state signal
+                # fires synchronously inside start() and its slot reads
+                # self._recorder for the output path.
+                self._recorder = recorder
+            recorder.start(region, out, profile)
+        except (rec.RecorderError, OSError, RuntimeError) as exc:
+            QMessageBox.warning(self, "record failed", str(exc))
+            return
+        self._rec_secs = -1
+        logger.info("recording region %s -> %s", region.as_ffmpeg_geom(), out)
+
+    def _stop_recording(self) -> None:
+        """Graceful stop; the recorder's own watchdog force-kills hangs."""
+        recorder = self._recorder
+        if recorder is not None:
+            recorder.stop()
+
+    def _on_rec_state(self, state: str) -> None:
+        if state == "recording":
+            self.btn_rec.setText("⏺ 0:00")
+            self._set_rec_button_active(True)
+            if self._recorder is not None and self._recorder.output is not None:
+                self.statusBar().showMessage(f"Recording → {self._recorder.output.name}")
+        elif state == "stopping":
+            self.btn_rec.setText("⏹ finishing…")
+        else:  # finished / failed
+            self.btn_rec.setText("⏺ Rec")
+            self._set_rec_button_active(False)
+
+    def _set_rec_button_active(self, active: bool) -> None:
+        self.btn_rec.setProperty("rec", "on" if active else "off")
+        self.btn_rec.style().unpolish(self.btn_rec)
+        self.btn_rec.style().polish(self.btn_rec)
+
+    def _on_rec_saved(self, path: str) -> None:
+        logger.info("recording saved: %s", path)
+        if self._closing:
+            return  # no Explorer popping up while the window dies
+        self.statusBar().showMessage(f"Saved clip: {path}")
+        # Reveal the file in Explorer (fire-and-forget, absolute path:
+        # never resolve "explorer" through CWD-relative search order).
+        with contextlib.suppress(OSError):
+            subprocess.Popen([str(Path(os.environ["WINDIR"]) / "explorer.exe"), "/select,", path])
+
+    def _on_rec_error(self, message: str) -> None:
+        logger.warning("recording failed: %s", message)
+        if not self._closing:
+            QMessageBox.warning(self, "recording failed", message)
+
     # -- file dialog ------------------------------------------------------------------
 
     def _open_dialog(self, view: ViewId) -> None:
@@ -485,6 +605,15 @@ class MainWindow(QMainWindow):
     # -- timers ------------------------------------------------------------------
 
     def _on_ui_tick(self) -> None:
+        # Recording elapsed time on the Rec button (once per second) runs
+        # before the engine guard: recording works without loaded videos.
+        # Only while truly RECORDING: in STOPPING the "finishing…" label
+        # must not be overwritten by the timer.
+        if self._recorder is not None and self._recorder.state is rec.RecorderState.RECORDING:
+            secs = int(self._recorder.elapsed_seconds())
+            if secs != self._rec_secs:
+                self._rec_secs = secs
+                self.btn_rec.setText(f"⏺ {secs // 60}:{secs % 60:02d}")
         if self.engine is None:
             return
         try:

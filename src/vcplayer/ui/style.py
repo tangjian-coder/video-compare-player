@@ -79,6 +79,20 @@ QPushButton#syncButton {
 QPushButton#syncButton:hover {
     background: #48484a;
 }
+QPushButton#recButton {
+    color: #ff453a;
+    font-weight: 600;
+}
+QPushButton#recButton:hover {
+    background: #48484a;
+}
+QPushButton#recButton[rec="on"] {
+    background: #ff453a;
+    color: #ffffff;
+}
+QPushButton#recButton[rec="on"]:hover {
+    background: #ff6961;
+}
 QComboBox {
     background: #2c2c2e;
     color: #f2f2f7;
