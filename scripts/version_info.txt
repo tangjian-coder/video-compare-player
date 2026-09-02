@@ -1,0 +1,31 @@
+# UTF-8
+#
+# Windows VERSIONINFO resource embedded into vcplayer.exe.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+      StringTable(
+        u'080404b0',
+        [StringStruct(u'CompanyName', u'tangjian-coder'),
+        StringStruct(u'FileDescription', u'Dual-video synchronized comparison player'),
+        StringStruct(u'FileVersion', u'1.0.0'),
+        StringStruct(u'InternalName', u'vcplayer'),
+        StringStruct(u'LegalCopyright', u'Copyright (c) tangjian-coder'),
+        StringStruct(u'OriginalFilename', u'vcplayer.exe'),
+        StringStruct(u'ProductName', u'video-compare-player'),
+        StringStruct(u'ProductVersion', u'1.0.0')])
+      ]),
+    VarFileInfo([VarStruct(u'Translation', [2052, 1200])])
+  ]
+)
