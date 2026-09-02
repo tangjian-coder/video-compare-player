@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .config import VENDOR_DIR, AppConfig
+from .config import ASSETS_DIR, VENDOR_DIR, AppConfig
 
 if TYPE_CHECKING:
     from PySide6.QtWidgets import QApplication
@@ -26,13 +26,13 @@ def _apply_window_icon(app: QApplication) -> None:
 
     icon = QIcon()
     for size in ICON_SIZES:
-        path = VENDOR_DIR.parent / "assets" / f"icon-{size}.png"
+        path = ASSETS_DIR / f"icon-{size}.png"
         if path.is_file():
             icon.addFile(str(path), QSize(size, size))
     if not icon.isNull():
         app.setWindowIcon(icon)
     else:
-        logger.warning("no app icon files found under assets/")
+        logger.warning("no app icon files found under %s", ASSETS_DIR)
 
 
 def _prepare_libmpv_path() -> None:

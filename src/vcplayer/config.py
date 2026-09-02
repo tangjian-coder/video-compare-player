@@ -5,14 +5,48 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_PATH = PROJECT_ROOT / "configs" / "settings.json"
-VENDOR_DIR = PROJECT_ROOT / "vendor"
+
+def _resource_root() -> Path:
+    """Read-only resources root (vendor/, assets/).
+
+    Frozen: PyInstaller onefile extraction dir (sys._MEIPASS).
+    Dev: the project checkout root.
+    """
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+        return Path(sys.executable).resolve().parent  # onedir fallback
+    return Path(__file__).resolve().parents[2]
+
+
+def _data_root() -> Path:
+    """Writable data root (configs/, logs/).
+
+    Frozen: %LOCALAPPDATA%\\vcplayer so the exe can live in a read-only dir.
+    Dev: the project checkout root.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "vcplayer"
+        return Path.home() / ".vcplayer"
+    return Path(__file__).resolve().parents[2]
+
+
+RESOURCE_ROOT = _resource_root()
+DATA_ROOT = _data_root()
+CONFIG_PATH = DATA_ROOT / "configs" / "settings.json"
+LOG_DIR = DATA_ROOT / "logs"
+VENDOR_DIR = RESOURCE_ROOT / "vendor"
+ASSETS_DIR = RESOURCE_ROOT / "assets"
 
 # Playback speed bounds, mirroring the UI speed steps (0.1x .. 4.0x).
 _MIN_SPEED = 0.1

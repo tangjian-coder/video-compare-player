@@ -8,7 +8,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from .config import PROJECT_ROOT
+from .config import LOG_DIR
 
 
 def _setup_logging(debug: bool) -> None:
@@ -23,9 +23,9 @@ def _setup_logging(debug: bool) -> None:
         console.setFormatter(fmt)
         root.addHandler(console)
 
-    log_dir = PROJECT_ROOT / "logs"
+    log_dir = LOG_DIR
     try:
-        log_dir.mkdir(exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
             log_dir / "vcplayer.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
         )
