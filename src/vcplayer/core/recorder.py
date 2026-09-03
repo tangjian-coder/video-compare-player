@@ -105,6 +105,11 @@ class CaptureSupport:
     off_primary: EncoderProfile | None
 
 
+# Under pythonw (no console) each console subprocess would pop up its
+# own cmd window; CREATE_NO_WINDOW suppresses that everywhere.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
 def _run_capture(ffmpeg: Path, args: list[str]) -> str:
     """Run ffmpeg with -version-style probes, returning combined output."""
     res = subprocess.run(
@@ -113,6 +118,7 @@ def _run_capture(ffmpeg: Path, args: list[str]) -> str:
         text=True,
         timeout=15,
         check=False,
+        creationflags=_NO_WINDOW,
     )
     return res.stdout + res.stderr
 
@@ -125,6 +131,7 @@ def _dry_run(ffmpeg: Path, args: list[str]) -> bool:
             capture_output=True,
             timeout=15,
             check=False,
+            creationflags=_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("ffmpeg dry-run failed: %s", exc)
@@ -230,6 +237,17 @@ def probe_capabilities(ffmpeg: Path) -> CaptureSupport | None:
         )
     _support_cache[key] = support
     return support
+
+
+def warm_up_probe() -> None:
+    """Pre-populate the probe cache so the first Rec click is instant.
+
+    Spawning probes costs ~1s of subprocess latency; run this in a
+    background thread right after startup, before the user clicks Rec.
+    """
+    ffmpeg = locate_ffmpeg()
+    if ffmpeg is not None:
+        probe_capabilities(ffmpeg)
 
 
 def locate_ffmpeg() -> Path | None:
@@ -339,6 +357,33 @@ def region_fully_on_screens(region: Region, screens: list[ScreenRect]) -> bool:
         if not any(sx <= cx < sx + sw and sy <= cy < sy + sh for sx, sy, sw, sh in screens):
             return False
     return True
+
+
+def clamp_region_to_desktop(region: Region, screens: list[ScreenRect]) -> Region:
+    """Shrink overhanging region edges onto the virtual desktop.
+
+    A maximized window's client area extends a few px past the screen
+    on every side (Windows "hanging" borders): clip those invisible
+    slivers off so region checks pass.
+    """
+    min_x = min(s[0] for s in screens)
+    min_y = min(s[1] for s in screens)
+    max_x = max(s[0] + s[2] for s in screens)
+    max_y = max(s[1] + s[3] for s in screens)
+    x, y, w, h = region.x, region.y, region.w, region.h
+    if x < min_x:
+        w -= min_x - x
+        x = min_x
+    if y < min_y:
+        h -= min_y - y
+        y = min_y
+    if x + w > max_x:
+        w = max_x - x
+    if y + h > max_y:
+        h = max_y - y
+    w = max(_REGION_ALIGN, w - w % _REGION_ALIGN)
+    h = max(_REGION_ALIGN, h - h % _REGION_ALIGN)
+    return Region(x=x, y=y, w=w, h=h)
 
 
 def default_output_dir() -> Path:
@@ -470,6 +515,7 @@ def repair_mp4(ffmpeg: Path, path: Path) -> bool:
         capture_output=True,
         timeout=60,
         check=False,
+        creationflags=_NO_WINDOW,
     )
     if res.returncode == 0 and fixed.is_file() and fixed.stat().st_size > 0:
         try:

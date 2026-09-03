@@ -11,6 +11,7 @@ import contextlib
 import logging
 import os
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -214,6 +215,10 @@ class MainWindow(QMainWindow):
         if right is not None:
             self.open_video("b", right)
         self.statusBar().showMessage("Drop a video into each block to compare")
+        # Warm the recorder's ffmpeg probe cache in the background so
+        # the first Rec click starts instantly instead of paying ~1s
+        # of probe latency (subprocesses never touch the GIL).
+        threading.Thread(target=rec.warm_up_probe, daemon=True).start()
         logger.info("main window initialized")
 
     def _wire_view(self, view: VideoView, view_id: ViewId) -> None:
@@ -510,6 +515,8 @@ class MainWindow(QMainWindow):
             return
         region = rec.physical_region(self.splitter)
         screens = rec.screen_physical_rects()
+        # Clip invisible slivers a maximized window hangs past the screen.
+        region = rec.clamp_region_to_desktop(region, screens)
         primary = QGuiApplication.primaryScreen()
         pg = primary.geometry()
         pdpr = primary.devicePixelRatio()

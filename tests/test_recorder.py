@@ -127,6 +127,21 @@ def test_region_fully_on_screens_across_two_monitors() -> None:
     assert not region_fully_on_screens(Region(3700, 100, 240, 50), screens)
 
 
+def test_clamp_region_to_desktop_trims_maximized_overhang() -> None:
+    """Maximized windows hang ~8px past the screen on every side."""
+    from vcplayer.core.recorder import clamp_region_to_desktop
+
+    screens = [(0, 0, 1920, 1080), (-1920, 3, 1920, 1080)]
+    # Right edge 8px past the primary screen: trimmed to 1920 wide total.
+    clamped = clamp_region_to_desktop(Region(24, 47, 1904, 884), screens)
+    assert clamped.x == 24
+    assert clamped.w == 1896
+    assert clamped.h == 884
+    # Fully inside: unchanged.
+    same = clamp_region_to_desktop(Region(100, 100, 800, 600), screens)
+    assert (same.x, same.w, same.h) == (100, 800, 600)
+
+
 def test_unique_output_path_suffixes_collisions(tmp_path: Path) -> None:
     first = unique_output_path(tmp_path, "20260902_120000")
     first.touch()
@@ -429,3 +444,58 @@ def test_verdict_exception_forces_failed_not_stuck(
     assert errors == ["recording finalization error"]
     assert recorder.state is RecorderState.FAILED
     assert not recorder.recording  # toggle works again
+
+
+# -- No-console subprocess flags ---------------------------------------------------
+
+
+def test_probe_subprocesses_suppress_console_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pythonw parents would flash a cmd window per probe subprocess."""
+    import subprocess as real_subprocess
+
+    from vcplayer.core import recorder as rec_mod
+
+    calls: list[dict[str, object]] = []
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = "ddagrab gdigrab h264_nvenc libx264"
+        stderr = ""
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        calls.append({"cmd": cmd, "kwargs": kwargs})
+        return _FakeCompleted()
+
+    monkeypatch.setattr(rec_mod.subprocess, "run", fake_run)
+    ff = Path("ffmpeg.exe")
+    rec_mod._support_cache.clear()
+    support = rec_mod.probe_capabilities(ff)
+    assert support is not None
+    assert calls
+    for c in calls:
+        assert c["kwargs"]["creationflags"] == real_subprocess.CREATE_NO_WINDOW
+
+
+def test_repair_mp4_suppresses_console_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess as real_subprocess
+
+    from vcplayer.core import recorder as rec_mod
+
+    captured: dict[str, object] = {}
+
+    class _FakeCompleted:
+        returncode = 1
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        captured.update(kwargs)
+        return _FakeCompleted()
+
+    monkeypatch.setattr(rec_mod.subprocess, "run", fake_run)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x" * 16)
+    assert rec_mod.repair_mp4(Path("ffmpeg.exe"), clip) is False
+    assert captured["creationflags"] == real_subprocess.CREATE_NO_WINDOW
