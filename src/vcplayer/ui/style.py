@@ -93,6 +93,20 @@ QPushButton#recButton[rec="on"] {
 QPushButton#recButton[rec="on"]:hover {
     background: #ff6961;
 }
+QPushButton#crosshairButton {
+    color: #ff9f0a;
+    font-weight: 600;
+}
+QPushButton#crosshairButton:hover {
+    background: #48484a;
+}
+QPushButton#crosshairButton:checked {
+    background: #ff9f0a;
+    color: #1e1e20;
+}
+QPushButton#crosshairButton:checked:hover {
+    background: #ffb340;
+}
 QComboBox {
     background: #2c2c2e;
     color: #f2f2f7;

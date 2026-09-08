@@ -97,6 +97,13 @@ class MainWindow(QMainWindow):
             "Record the two video views to an mp4 clip. (F9)\n"
             "Do not move or resize the window while recording."
         )
+        self.btn_crosshair = QPushButton("✛")
+        self.btn_crosshair.setObjectName("crosshairButton")
+        self.btn_crosshair.setCheckable(True)
+        self.btn_crosshair.setToolTip(
+            "Show a crosshair at the center of both views,\n"
+            "a fixed reference for comparing motion amplitude. (C)"
+        )
 
         transport = QHBoxLayout()
         transport.addStretch(1)
@@ -118,6 +125,7 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.btn_sync_clear)
         transport.addSpacing(12)
         transport.addWidget(self.btn_rec)
+        transport.addWidget(self.btn_crosshair)
         transport.addStretch(1)
 
         central = QWidget()
@@ -193,6 +201,7 @@ class MainWindow(QMainWindow):
         self.btn_align.clicked.connect(self._align_current_frames)
         self.btn_sync_clear.clicked.connect(self._clear_sync)
         self.btn_rec.clicked.connect(self._toggle_record)
+        self.btn_crosshair.toggled.connect(self._on_crosshair_toggled)
 
         self._add_shortcut(Qt.Key.Key_Space, self._toggle_play)
         self._add_shortcut(Qt.Key.Key_Left, lambda: self._step(-1))
@@ -204,11 +213,16 @@ class MainWindow(QMainWindow):
         self._add_shortcut(Qt.Key.Key_S, self._align_current_frames)
         self._add_shortcut(Qt.Key.Key_R, self._clear_sync)
         self._add_shortcut(Qt.Key.Key_F9, self._toggle_record)
+        self._add_shortcut(Qt.Key.Key_C, self._toggle_crosshair)
         self._add_shortcut(QKeySequence.StandardKey.Open, self._open_active)
 
         self._ui_timer.start(UI_TICK_MS)
         self._drift_timer.start(DRIFT_TICK_MS)
         self._load_timer.start(LOAD_TICK_MS)
+
+        # Players exist now: apply the persisted crosshair state (setChecked
+        # only fires toggled on an actual change).
+        self.btn_crosshair.setChecked(self.config.crosshair)
 
         if left is not None:
             self.open_video("a", left)
@@ -594,6 +608,26 @@ class MainWindow(QMainWindow):
         logger.warning("recording failed: %s", message)
         if not self._closing:
             QMessageBox.warning(self, "recording failed", message)
+
+    # -- crosshair ------------------------------------------------------------------
+
+    def _toggle_crosshair(self) -> None:
+        """C key: flip the checkable button (toggled does the rest)."""
+        self.btn_crosshair.setChecked(not self.btn_crosshair.isChecked())
+
+    def _on_crosshair_toggled(self, checked: bool) -> None:
+        """Show/hide the center crosshair on both views at once.
+
+        One shared reference mark, not per-view: the point is comparing
+        the two sides' motion against the same fixed position.
+        """
+        self.config.crosshair = checked
+        self.config.save()
+        if self.engine is None:
+            return  # before initialize(); state applies on setChecked there
+        self.view_a.player.set_crosshair(checked)
+        self.view_b.player.set_crosshair(checked)
+        self.statusBar().showMessage("Crosshair on" if checked else "Crosshair off")
 
     # -- file dialog ------------------------------------------------------------------
 

@@ -67,8 +67,20 @@ def test_clean_speed_handles_garbage() -> None:
 
 def test_save_and_load_roundtrip(tmp_path: Path) -> None:
     p = tmp_path / "cfg.json"
-    cfg = AppConfig(last_dir="D:/x", speed=0.5)
+    cfg = AppConfig(last_dir="D:/x", speed=0.5, crosshair=True)
     cfg.save(p)
     loaded = AppConfig.load(p)
     assert loaded.last_dir == "D:/x"
     assert loaded.speed == 0.5
+    assert loaded.crosshair is True
+
+
+def test_crosshair_defaults_off_and_tolerates_garbage(tmp_path: Path) -> None:
+    p = tmp_path / "cfg.json"
+    _write(p, '{"crosshair": true}')
+    assert AppConfig.load(p).crosshair is True
+    _write(p, "{}")
+    assert AppConfig.load(p).crosshair is False
+    # Absent key -> default; non-bool values fall back to truthiness of bool().
+    _write(p, '{"crosshair": 0}')
+    assert AppConfig.load(p).crosshair is False
