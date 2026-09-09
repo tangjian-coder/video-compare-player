@@ -217,21 +217,33 @@ class SyncEngine:
         deadband = 1.0 / fps_b
         if abs(d) > deadband:
             rate = max(-_MAX_NUDGE, min(_MAX_NUDGE, d / _FULL_NUDGE_DRIFT * _MAX_NUDGE))
-            self._set_b_speed(base_speed * (1.0 + rate))
+            target = base_speed * (1.0 + rate)
         else:
-            self._set_b_speed(base_speed)
+            target = base_speed
+        written = self._set_b_speed(target)
+        # Debug trace: intermittent drift-growth reports need a record of
+        # what the loop actually did, tick by tick (--debug only).
+        logger.debug(
+            "regulate: raw=%+.4f ewma=%+.4f target=%.4f %s",
+            raw,
+            d,
+            target,
+            "write" if written else "keep",
+        )
         return d
 
-    def _set_b_speed(self, speed: float) -> None:
+    def _set_b_speed(self, speed: float) -> bool:
         """Write B's speed only on meaningful change.
 
         Measured: every speed write costs B a ~1 ms playback hiccup, so
         rewriting an unchanged value every tick measurably drives drift.
+        Returns True when the speed was actually written.
         """
         if self._last_b_speed is not None and abs(speed - self._last_b_speed) < _SPEED_WRITE_EPS:
-            return
+            return False
         self.b.set_speed(speed)
         self._last_b_speed = speed
+        return True
 
     def _reset_runtime(self) -> None:
         """Forget regulate() state after the offset basis changes.

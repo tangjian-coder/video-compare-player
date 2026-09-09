@@ -72,6 +72,18 @@ class MainWindow(QMainWindow):
         self.btn_play.setObjectName("playButton")
         self.btn_step_fwd = QPushButton(">")
         self.btn_last = QPushButton(">|")
+        # Buttons must not keep focus: a focused button is re-activated by
+        # Space/Enter, double-triggering shortcuts (e.g. Space toggles play
+        # via QShortcut AND clicks the focused Play button). NoFocus keeps
+        # mouse interaction but drops all buttons from key delivery.
+        for btn in (
+            self.btn_first,
+            self.btn_step_back,
+            self.btn_play,
+            self.btn_step_fwd,
+            self.btn_last,
+        ):
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.speed_combo = QComboBox()
         for s in SPEED_STEPS:
             self.speed_combo.addItem(f"{s:g}x", s)
@@ -104,6 +116,17 @@ class MainWindow(QMainWindow):
             "Show a crosshair at the center of both views,\n"
             "a fixed reference for comparing motion amplitude. (C)"
         )
+        # Same NoFocus treatment for the remaining shortcut-bearing buttons
+        # (S / R / F9 / C keys would otherwise re-trigger them).
+        for btn in (
+            self.btn_open_a,
+            self.btn_open_b,
+            self.btn_align,
+            self.btn_sync_clear,
+            self.btn_rec,
+            self.btn_crosshair,
+        ):
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         transport = QHBoxLayout()
         transport.addStretch(1)
@@ -219,6 +242,12 @@ class MainWindow(QMainWindow):
         self._ui_timer.start(UI_TICK_MS)
         self._drift_timer.start(DRIFT_TICK_MS)
         self._load_timer.start(LOAD_TICK_MS)
+
+        # Apply persisted playback speed: mpv defaults to 1.0x regardless
+        # of the combo box, so without this the regulate() loop would
+        # compute corrections against a wrong base and drift would grow.
+        self.view_a.player.set_speed(self.config.speed)
+        self.view_b.player.set_speed(self.config.speed)
 
         # Players exist now: apply the persisted crosshair state (setChecked
         # only fires toggled on an actual change).
@@ -347,6 +376,7 @@ class MainWindow(QMainWindow):
             pa.pause()
             pb.pause()
             self._playing = False
+            logger.info("playback paused")
             # mpv pauses asynchronously; re-align once both have settled.
             QTimer.singleShot(200, self._resync_if_needed)
             return
@@ -366,6 +396,7 @@ class MainWindow(QMainWindow):
         pa.play()
         pb.play()
         self._playing = True
+        logger.info("playback started, speed=%.2f", self.config.speed)
         # No startup resync here: a hard seek during playback restarts B's
         # pipeline and creates the very skew it removes. The startup offset
         # (~40 ms pipeline wake-up asymmetry) is converged by the speed loop.
@@ -725,6 +756,17 @@ class MainWindow(QMainWindow):
         (Syncplay / mpv issue #13905 use the same scheme).
         """
         eng = self.engine
+        # Heartbeat before guards: proves the timer fires even when the
+        # regulation path is skipped (unloaded / paused / not synced).
+        self._drift_tick_count = getattr(self, "_drift_tick_count", 0) + 1
+        if self._drift_tick_count % 100 == 0:  # every ~10s at 100ms tick
+            logger.info(
+                "drift tick alive: count=%d playing=%s synced=%s ready=%s",
+                self._drift_tick_count,
+                self._playing,
+                eng.state.is_complete if eng else None,
+                eng.ready if eng else None,
+            )
         if eng is None or not eng.ready or not self._playing:
             return
         if not eng.state.is_complete:
