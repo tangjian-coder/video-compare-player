@@ -170,6 +170,7 @@ class MainWindow(QMainWindow):
         self._playhead_mono = 0.0
         self._playing = False
         self._closing = False
+        self._drift_tick_count = 0
         # Live readout lives in a permanent widget: showMessage() stays free
         # for event messages ("Synced: ..."), which would otherwise be
         # clobbered by the 15 ms UI tick.
@@ -243,11 +244,15 @@ class MainWindow(QMainWindow):
         self._drift_timer.start(DRIFT_TICK_MS)
         self._load_timer.start(LOAD_TICK_MS)
 
-        # Apply persisted playback speed: mpv defaults to 1.0x regardless
-        # of the combo box, so without this the regulate() loop would
-        # compute corrections against a wrong base and drift would grow.
-        self.view_a.player.set_speed(self.config.speed)
-        self.view_b.player.set_speed(self.config.speed)
+        # Apply persisted playback speed through the combo's sanitized
+        # value: mpv defaults to 1.0x regardless of the combo box, and a
+        # hand-edited config could hold a value outside SPEED_STEPS (combo
+        # falls back to 1.0x) — routing through itemData keeps displayed,
+        # applied and persisted speed identical by construction.
+        speed = float(self.speed_combo.itemData(self.speed_combo.currentIndex()))
+        self.config.speed = speed
+        self.view_a.player.set_speed(speed)
+        self.view_b.player.set_speed(speed)
 
         # Players exist now: apply the persisted crosshair state (setChecked
         # only fires toggled on an actual change).
@@ -758,7 +763,7 @@ class MainWindow(QMainWindow):
         eng = self.engine
         # Heartbeat before guards: proves the timer fires even when the
         # regulation path is skipped (unloaded / paused / not synced).
-        self._drift_tick_count = getattr(self, "_drift_tick_count", 0) + 1
+        self._drift_tick_count += 1
         if self._drift_tick_count % 100 == 0:  # every ~10s at 100ms tick
             logger.info(
                 "drift tick alive: count=%d playing=%s synced=%s ready=%s",

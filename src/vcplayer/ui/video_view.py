@@ -371,6 +371,10 @@ class VideoView(QFrame):
             f"Rotate {view_name} 90° clockwise (current angle on the button;"
             " double-click the video to reset)"
         )
+        # NoFocus like the transport buttons: a focused mini button would
+        # re-trigger on Space (double-toggle play / step-off the anchor).
+        for btn in (self.btn_step_back, self.btn_step_fwd, self.btn_play, self.btn_rotate):
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # Default text matches the always-rendered design (see
         # _on_zoom_changed): empty here would leave the footer without a
         # readout until the first wheel event.
