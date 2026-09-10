@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 ICON_SIZES = (256, 128, 64, 48, 32, 16)
 
+# Must match the AUMID written into shortcuts (see scripts/set_aumid.py).
+APP_USER_MODEL_ID = "tangjian-coder.vcplayer.1"
+
 
 def _apply_window_icon(app: QApplication) -> None:
     """Set the app icon from assets/ (multi-resolution PNG bundle)."""
@@ -62,10 +65,15 @@ def _set_app_user_model_id() -> None:
     """
     import ctypes
 
-    with contextlib.suppress(Exception):
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(  # type: ignore[attr-defined]
-            "tangjian-coder.vcplayer.1"
+    try:
+        hr: int = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(  # type: ignore[attr-defined]
+            APP_USER_MODEL_ID
         )
+    except Exception:
+        logger.warning("AppUserModelID unsupported; taskbar pinning may degrade", exc_info=True)
+        return
+    if hr != 0:
+        logger.warning("SetCurrentProcessExplicitAppUserModelID failed: hr=0x%08X", hr & 0xFFFFFFFF)
 
 
 def run(left: Path | None, right: Path | None) -> int:
