@@ -1,8 +1,12 @@
-"""Main window: dual video blocks + shared transport + timeline + sync logic.
+"""Main window: N dynamic video blocks + shared transport + timeline + sync.
 
 Each video block (VideoView) has its own frame-step and sync controls, which
 is required for the sync-point workflow: step each view independently to the
-same physical moment, then mark both sync points.
+same physical moment, then mark all sync points at once.
+
+Views are added (＋ / V) and removed (－) dynamically, 2 minimum, 4 maximum.
+View A is the master timeline; every other view gets its own SyncEngine
+against A, so offsets and drift are tracked per follower pair.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ import os
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
@@ -34,7 +38,7 @@ from PySide6.QtWidgets import (
 from ..config import AppConfig
 from ..core import recorder as rec
 from ..core.player import PlayerController, PlayerError
-from ..core.sync import SyncEngine, SyncError, ViewId
+from ..core.sync import SyncEngine, SyncError, ViewId, intersect_master_ranges
 from .timeline import TimelineWidget
 from .video_view import VIDEO_EXTS, VideoView
 
@@ -46,6 +50,10 @@ DRIFT_TICK_MS = 100
 LOAD_TICK_MS = 100
 LOAD_TIMEOUT_MS = 10_000
 
+MIN_VIEWS = 2
+MAX_VIEWS = 4
+ALL_VIEW_IDS: tuple[ViewId, ...] = ("a", "b", "c", "d")
+
 
 class MainWindow(QMainWindow):
     """Top-level window assembling views, transport, timeline and sync logic."""
@@ -56,11 +64,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("video-compare-player")
         self.resize(config.window.width, config.window.height)
 
-        self.view_a = VideoView("A")
-        self.view_b = VideoView("B")
+        self.views: dict[ViewId, VideoView] = {"a": VideoView("A"), "b": VideoView("B")}
+        self.view_ids: list[ViewId] = ["a", "b"]
+        self.engines: dict[ViewId, SyncEngine] = {}
+        self._initialized = False
+
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.splitter.addWidget(self.view_a)
-        self.splitter.addWidget(self.view_b)
+        for view in self.views.values():
+            self.splitter.addWidget(view)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 1)
 
@@ -90,13 +101,22 @@ class MainWindow(QMainWindow):
         self.speed_combo.setCurrentIndex(
             SPEED_STEPS.index(config.speed) if config.speed in SPEED_STEPS else 3
         )
-        self.btn_open_a = QPushButton("Open A")
-        self.btn_open_b = QPushButton("Open B")
+        self._open_btns: dict[ViewId, QPushButton] = {}
+        for vid in ALL_VIEW_IDS:
+            btn = QPushButton(f"Open {vid.upper()}")
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self._open_btns[vid] = btn
+        self.btn_add = QPushButton("＋")
+        self.btn_add.setObjectName("addViewButton")
+        self.btn_add.setToolTip("Add another comparison view. (V)")
+        self.btn_remove = QPushButton("－")
+        self.btn_remove.setObjectName("removeViewButton")
+        self.btn_remove.setToolTip("Remove the last view.")
         self.btn_align = QPushButton("⇄ Align current frames")
         self.btn_align.setObjectName("alignButton")
         self.btn_align.setToolTip(
             "Step each video to the same physical moment (e.g. stopwatch tick),\n"
-            "then click this: both current frames become the sync anchor. (S)"
+            "then click this: all current frames become the sync anchors. (S)"
         )
         self.sync_chip = QLabel("● not synced")
         self.sync_chip.setObjectName("syncChip")
@@ -106,21 +126,21 @@ class MainWindow(QMainWindow):
         self.btn_rec = QPushButton("⏺ Rec")
         self.btn_rec.setObjectName("recButton")
         self.btn_rec.setToolTip(
-            "Record the two video views to an mp4 clip. (F9)\n"
+            "Record the video views to an mp4 clip. (F9)\n"
             "Do not move or resize the window while recording."
         )
         self.btn_crosshair = QPushButton("✛")
         self.btn_crosshair.setObjectName("crosshairButton")
         self.btn_crosshair.setCheckable(True)
         self.btn_crosshair.setToolTip(
-            "Show a crosshair at the center of both views,\n"
+            "Show a crosshair at the center of every view,\n"
             "a fixed reference for comparing motion amplitude. (C)"
         )
         # Same NoFocus treatment for the remaining shortcut-bearing buttons
-        # (S / R / F9 / C keys would otherwise re-trigger them).
+        # (S / R / F9 / C / V keys would otherwise re-trigger them).
         for btn in (
-            self.btn_open_a,
-            self.btn_open_b,
+            self.btn_add,
+            self.btn_remove,
             self.btn_align,
             self.btn_sync_clear,
             self.btn_rec,
@@ -130,8 +150,10 @@ class MainWindow(QMainWindow):
 
         transport = QHBoxLayout()
         transport.addStretch(1)
-        transport.addWidget(self.btn_open_a)
-        transport.addWidget(self.btn_open_b)
+        for vid in ALL_VIEW_IDS:
+            transport.addWidget(self._open_btns[vid])
+        transport.addWidget(self.btn_add)
+        transport.addWidget(self.btn_remove)
         transport.addSpacing(24)
         transport.addWidget(self.btn_first)
         transport.addWidget(self.btn_step_back)
@@ -161,7 +183,6 @@ class MainWindow(QMainWindow):
         vbox.addLayout(transport)
         self.setCentralWidget(central)
 
-        self.engine: SyncEngine | None = None
         self._active_view: ViewId = "a"
         self._load_pending: dict[ViewId, tuple[Path, int]] = {}
         # Playhead smoothing state: interpolate between mpv frame updates.
@@ -176,7 +197,7 @@ class MainWindow(QMainWindow):
         # clobbered by the 15 ms UI tick.
         self._status_live = QLabel("")
         self.statusBar().addPermanentWidget(self._status_live)
-        self._timeline_durs: tuple[float | None, float | None] | None = None
+        self._timeline_durs: dict[ViewId, float | None] | None = None
         # Screen recorder session (created on first F9/Rec click).
         self._recorder: rec.ScreenRecorder | None = None
         self._rec_secs = -1  # last elapsed second shown on the button
@@ -188,34 +209,34 @@ class MainWindow(QMainWindow):
         self._load_timer = QTimer(self)
         self._load_timer.timeout.connect(self._on_load_tick)
 
+        self._refresh_view_buttons()
+
     # -- lifecycle --------------------------------------------------------------
 
-    def initialize(self, left: Path | None, right: Path | None) -> None:
-        """Create the sync engine and wire signals; call after the window is shown."""
+    def initialize(self, videos: Sequence[Path]) -> None:
+        """Create the sync engines and wire signals; call after the window is shown."""
+        if self._initialized or self._closing:
+            return  # single-shot entry; never double-wire shortcuts/signals
         try:
-            self.view_a.ensure_player()
-            self.view_b.ensure_player()
-            self.engine = SyncEngine(self.view_a.player, self.view_b.player)
+            self.views["a"].ensure_player()
+            self.views["b"].ensure_player()
+            self.engines["b"] = SyncEngine(self.views["a"].player, self.views["b"].player)
         except (RuntimeError, PlayerError) as exc:
             QMessageBox.critical(self, "mpv error", str(exc))
             self.close()  # never leave a dead, unresponsive window on screen
             return
 
-        self._wire_view(self.view_a, "a")
-        self._wire_view(self.view_b, "b")
-        # Ctrl-modified gestures steer both surfaces together: each side
-        # converts zoom steps / pointer deltas with its own metrics.
-        self.view_a.surface.paired_zoom.connect(self.view_b.surface.apply_paired_zoom)
-        self.view_b.surface.paired_zoom.connect(self.view_a.surface.apply_paired_zoom)
-        self.view_a.surface.paired_pan.connect(self.view_b.surface.apply_paired_pan)
-        self.view_b.surface.paired_pan.connect(self.view_a.surface.apply_paired_pan)
-        self.view_a.surface.paired_reset.connect(self.view_b.surface.apply_paired_reset)
-        self.view_b.surface.paired_reset.connect(self.view_a.surface.apply_paired_reset)
+        self._wire_view(self.views["a"], "a")
+        self._wire_view(self.views["b"], "b")
+        self._connect_gestures(self.views["a"])
+        self._connect_gestures(self.views["b"])
         self.timeline.scrub_preview.connect(self._on_scrub_preview)
         self.timeline.seek_committed.connect(self._on_seek_committed)
 
-        self.btn_open_a.clicked.connect(lambda: self._open_dialog("a"))
-        self.btn_open_b.clicked.connect(lambda: self._open_dialog("b"))
+        for vid in ALL_VIEW_IDS:
+            self._open_btns[vid].clicked.connect(lambda _=False, v=vid: self._open_dialog(v))
+        self.btn_add.clicked.connect(lambda: self._add_view())
+        self.btn_remove.clicked.connect(self._remove_last_view)
         self.btn_first.clicked.connect(self._goto_first)
         self.btn_step_back.clicked.connect(lambda: self._step(-1))
         self.btn_play.clicked.connect(self._toggle_play)
@@ -238,6 +259,7 @@ class MainWindow(QMainWindow):
         self._add_shortcut(Qt.Key.Key_R, self._clear_sync)
         self._add_shortcut(Qt.Key.Key_F9, self._toggle_record)
         self._add_shortcut(Qt.Key.Key_C, self._toggle_crosshair)
+        self._add_shortcut(Qt.Key.Key_V, self._add_view)
         self._add_shortcut(QKeySequence.StandardKey.Open, self._open_active)
 
         self._ui_timer.start(UI_TICK_MS)
@@ -251,17 +273,21 @@ class MainWindow(QMainWindow):
         # applied and persisted speed identical by construction.
         speed = float(self.speed_combo.itemData(self.speed_combo.currentIndex()))
         self.config.speed = speed
-        self.view_a.player.set_speed(speed)
-        self.view_b.player.set_speed(speed)
+        for view in self.views.values():
+            view.player.set_speed(speed)
 
+        self._initialized = True
         # Players exist now: apply the persisted crosshair state (setChecked
         # only fires toggled on an actual change).
         self.btn_crosshair.setChecked(self.config.crosshair)
 
-        if left is not None:
-            self.open_video("a", left)
-        if right is not None:
-            self.open_video("b", right)
+        # Views beyond the first two come from the CLI (2-4 videos).
+        for path in videos[2:]:
+            self._add_view(load=path)
+        if len(videos) > 0 and videos[0] is not None:
+            self.open_video("a", videos[0])
+        if len(videos) > 1 and videos[1] is not None:
+            self.open_video("b", videos[1])
         self.statusBar().showMessage("Drop a video into each block to compare")
         # Warm the recorder's ffmpeg probe cache in the background so
         # the first Rec click starts instantly instead of paying ~1s
@@ -276,6 +302,29 @@ class MainWindow(QMainWindow):
         view.btn_step_back.clicked.connect(lambda checked=False, v=view_id: self._step_view(v, -1))
         view.btn_step_fwd.clicked.connect(lambda checked=False, v=view_id: self._step_view(v, 1))
         view.btn_play.clicked.connect(lambda checked=False, v=view_id: self._toggle_play_view(v))
+
+    def _connect_gestures(self, view: VideoView) -> None:
+        """Steer all other surfaces when one view gestures (non-Ctrl)."""
+        view.surface.paired_zoom.connect(
+            lambda direction, v=view: self._broadcast_zoom(v, direction)
+        )
+        view.surface.paired_pan.connect(lambda dx, dy, v=view: self._broadcast_pan(v, dx, dy))
+        view.surface.paired_reset.connect(lambda v=view: self._broadcast_reset(v))
+
+    def _broadcast_zoom(self, source: VideoView, direction: int) -> None:
+        for view in self.views.values():
+            if view is not source:
+                view.surface.apply_paired_zoom(direction)
+
+    def _broadcast_pan(self, source: VideoView, dx_px: float, dy_px: float) -> None:
+        for view in self.views.values():
+            if view is not source:
+                view.surface.apply_paired_pan(dx_px, dy_px)
+
+    def _broadcast_reset(self, source: VideoView) -> None:
+        for view in self.views.values():
+            if view is not source:
+                view.surface.apply_paired_reset()
 
     def _add_shortcut(
         self, key: Qt.Key | QKeySequence | QKeySequence.StandardKey, handler: Callable[[], None]
@@ -298,22 +347,134 @@ class MainWindow(QMainWindow):
         self.config.window.width = self.width()
         self.config.window.height = self.height()
         self.config.save()
-        for view in (self.view_a, self.view_b):
+        for view in self.views.values():
             with contextlib.suppress(RuntimeError):
                 view.player.terminate()  # player may never have been created
         super().closeEvent(event)
 
+    # -- dynamic views --------------------------------------------------------
+
+    def _recording(self) -> bool:
+        return self._recorder is not None and self._recorder.recording
+
+    def _add_view(self, load: Path | None = None) -> None:
+        """Append a new view (up to MAX_VIEWS); optionally load a video."""
+        if not self._initialized:
+            return
+        if self._recording():
+            self.statusBar().showMessage("Stop recording before changing views")
+            return
+        if len(self.view_ids) >= MAX_VIEWS:
+            self.statusBar().showMessage(f"Maximum {MAX_VIEWS} views")
+            return
+        vid: ViewId = ALL_VIEW_IDS[len(self.view_ids)]
+        view = VideoView(vid.upper())
+        # Parent the widget before creating its player: ensure_player() hands
+        # the pane's native window to mpv, and reparenting afterwards could
+        # recreate that handle. The view is registered up front and rolled
+        # back on failure — the rollback runs before any modal dialog so the
+        # nested event loop never sees the half-registered state.
+        self.views[vid] = view
+        self.splitter.addWidget(view)
+        self.splitter.setStretchFactor(self.splitter.indexOf(view), 1)
+        self._equalize_splitter()
+        try:
+            view.ensure_player()
+            self.engines[vid] = SyncEngine(self.views["a"].player, view.player)
+            self._wire_view(view, vid)
+            self._connect_gestures(view)
+            view.player.set_speed(self.config.speed)
+            if self.btn_crosshair.isChecked():
+                view.player.set_crosshair(True)
+        except (RuntimeError, PlayerError) as exc:
+            logger.warning("view %s failed to start: %s", vid, exc)
+            self._destroy_view(vid)
+            QMessageBox.warning(self, "mpv error", str(exc))
+            return
+        self.view_ids.append(vid)
+        self._refresh_view_buttons()
+        self._apply_view_size_policy()
+        self.timeline.set_tracks(self.view_ids)
+        self._timeline_durs = None  # force a refresh for the new track
+        self._refresh_sync_ui()
+        logger.info("view %s added (%d views)", vid, len(self.view_ids))
+        if load is not None:
+            self.open_video(vid, load)
+        else:
+            self.statusBar().showMessage(f"View {vid.upper()} added — drop or open a video")
+
+    def _remove_last_view(self) -> None:
+        """Tear down the most recently added view (A/B stay)."""
+        if not self._initialized or len(self.view_ids) <= MIN_VIEWS:
+            return
+        if self._recording():
+            self.statusBar().showMessage("Stop recording before changing views")
+            return
+        self._stop_playback()
+        vid = self.view_ids[-1]
+        self._destroy_view(vid)
+        if self._active_view == vid:
+            self._active_view = "a"
+        self._refresh_view_buttons()
+        self._apply_view_size_policy()
+        self.timeline.set_tracks(self.view_ids)
+        self._timeline_durs = None  # force a refresh without the dropped view
+        self._refresh_sync_ui()
+        logger.info("view %s removed (%d views)", vid, len(self.view_ids))
+        self.statusBar().showMessage(f"View {vid.upper()} removed")
+
+    def _apply_view_size_policy(self) -> None:
+        """Shrink per-view minimums as views are added.
+
+        MpvSurface enforces 400x260 by default; four of those (~1630
+        logical px) exceed the usable width on scaled 1080p screens and
+        force the window off-screen (which also blocks recording).
+        """
+        count = len(self.view_ids)
+        min_w, min_h = (400, 260) if count <= 2 else (300, 200) if count == 3 else (240, 150)
+        for view in self.views.values():
+            view.surface.setMinimumSize(min_w, min_h)
+
+    def _destroy_view(self, vid: ViewId) -> None:
+        """Remove a view from state, layout and life (player released)."""
+        self.view_ids = [v for v in self.view_ids if v != vid]
+        view = self.views.pop(vid, None)
+        self.engines.pop(vid, None)
+        self._load_pending.pop(vid, None)
+        if view is not None:
+            with contextlib.suppress(RuntimeError):
+                view.player.terminate()
+            if self.splitter.indexOf(view) >= 0:
+                view.setParent(None)
+            view.deleteLater()
+        self._equalize_splitter()
+
+    def _equalize_splitter(self) -> None:
+        """Give every view the same width (keeps added views from
+        squeezing only their neighbour)."""
+        n = max(1, self.splitter.count())
+        if self.splitter.width() > 0:
+            self.splitter.setSizes([self.splitter.width() // n] * n)
+
+    def _refresh_view_buttons(self) -> None:
+        """Show Open buttons for existing views; gate ＋/－ by the limits."""
+        for vid, btn in self._open_btns.items():
+            btn.setVisible(vid in self.views)
+        self.btn_add.setEnabled(len(self.view_ids) < MAX_VIEWS)
+        self.btn_remove.setEnabled(len(self.view_ids) > MIN_VIEWS)
+
     # -- loading ------------------------------------------------------------------
 
     def open_video(self, view: ViewId, path: Path) -> None:
-        """Load a video into view A or B."""
+        """Load a video into one of the views."""
+        if view not in self.views:
+            return
         self._stop_playback()
-        # A previous sync offset is meaningless for a new file.
-        if self.engine is not None and self.engine.state.is_complete:
-            self._clear_sync()
-        player = self.view_a.player if view == "a" else self.view_b.player
+        # Sync offsets involving a reloaded view are meaningless for the
+        # new file (a reload of A breaks every pair, a follower only its own).
+        self._invalidate_sync(view)
         try:
-            player.load(path)
+            self.views[view].player.load(path)
         except PlayerError as exc:
             QMessageBox.warning(self, "open failed", str(exc))
             return
@@ -323,20 +484,25 @@ class MainWindow(QMainWindow):
 
     def _on_load_tick(self) -> None:
         """Poll pending loads; finalize range once both views are ready."""
+        if not self._initialized:
+            return
         # Iterate a snapshot and delete finished entries BEFORE any modal
         # dialog runs: QMessageBox spins the event loop, so this slot can
         # re-enter while the dialog is open; a deferred delete would then
         # raise KeyError or drop an entry queued during the dialog.
         for view_id, (path, waited) in list(self._load_pending.items()):
-            view = self.view_a if view_id == "a" else self.view_b
+            view = self.views.get(view_id)
+            if view is None:  # the view was removed while loading
+                self._load_pending.pop(view_id, None)
+                continue
             meta = view.player.try_capture_meta()
             if meta is None and waited < LOAD_TIMEOUT_MS:
                 self._load_pending[view_id] = (path, waited + LOAD_TICK_MS)
                 continue
-            del self._load_pending[view_id]
+            self._load_pending.pop(view_id, None)
             if meta is not None:
                 view.set_loaded_name(meta.path.name)
-                self.statusBar().showMessage(f"{view_id.upper()}: {path.name} loaded")
+                self._on_view_loaded(view_id, path)
             elif view.player.duration is not None:
                 # Duration but no frame rate: a container without fps info
                 # cannot be synced (playback itself may still work).
@@ -349,22 +515,86 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "open failed", f"Timed out loading:\n{path}")
 
-        # Push per-side durations without waiting for engine.ready: with
-        # only one side loaded the other renders as a dead track, and the
-        # loaded side already shows its real extent.
-        if self.engine is not None:
-            durs = (self.view_a.player.duration, self.view_b.player.duration)
-            if durs != self._timeline_durs:
-                self._timeline_durs = durs
-                self.timeline.set_durations(*durs)
+        # Push per-view durations without waiting for engine readiness:
+        # with only one side loaded the other renders as a dead track, and
+        # the loaded side already shows its real extent.
+        durs = {vid: self.views[vid].player.duration for vid in self.view_ids}
+        if durs != self._timeline_durs:
+            self._timeline_durs = durs
+            self.timeline.set_durations(durs)
+
+    def _on_view_loaded(self, view_id: ViewId, path: Path) -> None:
+        """Loaded-view bookkeeping: join a running synced playback if able."""
+        if self._playing and view_id != "a":
+            eng = self.engines.get(view_id)
+            if eng is not None and eng.ready and eng.state.is_complete:
+                a = self.views["a"].player
+                master = a.playback_time
+                if master is None:
+                    master = a.time_pos
+                if master is not None:
+                    eng.seek_follower(master)
+                    eng.reset_runtime()
+                    self.views[view_id].player.play()
+                    logger.info("view %s loaded and joined playback", view_id)
+                    self.statusBar().showMessage(
+                        f"{view_id.upper()}: {path.name} loaded, joined playback"
+                    )
+                    return
+                self.statusBar().showMessage(
+                    f"{view_id.upper()}: {path.name} loaded (paused) — press S to align"
+                )
+                logger.info("view %s loaded (not synced; stays paused)", view_id)
+                return
+        self.statusBar().showMessage(f"{view_id.upper()}: {path.name} loaded")
 
     # -- transport ------------------------------------------------------------------
 
-    def _require_engine(self) -> SyncEngine | None:
-        if self.engine is None or not self.engine.ready:
-            self.statusBar().showMessage("Load both videos first")
-            return None
-        return self.engine
+    def _any_engine_ready(self) -> bool:
+        return any(eng.ready for eng in self.engines.values())
+
+    def _require_ready(self) -> bool:
+        if not self._any_engine_ready():
+            self.statusBar().showMessage("Load at least two videos first")
+            return False
+        return True
+
+    def _master_range(self) -> tuple[float, float] | None:
+        """Master interval where every ready pair has frames."""
+        return intersect_master_ranges(self.engines.values())
+
+    def _reference_fps(self) -> float:
+        for eng in self.engines.values():
+            if eng.ready:
+                return eng.reference_fps
+        fps = self.views["a"].player.fps
+        return fps if fps and fps > 0 else 25.0
+
+    def _seek_master_all(self, master: float, *, exact: bool = True) -> None:
+        """Seek A once and every ready follower to one master position.
+
+        The target is clamped to the *intersection* of all ready ranges
+        before any player moves: clamping per engine would let the last
+        engine drag A away from the followers already seeked (the
+        intersection is always inside A's own range, so seeking A directly
+        with the clamped value is safe).
+        """
+        rng = self._master_range()
+        if rng is None:
+            if self._any_engine_ready():
+                self.statusBar().showMessage("No common range between loaded views")
+            return
+        master = min(max(master, rng[0]), rng[1])
+        a = self.views["a"].player
+        if exact:
+            a.seek_exact(master)
+        else:
+            a.seek_fast(master)
+        for eng in self.engines.values():
+            if eng.ready:
+                eng.seek_follower(master, exact=exact)
+                # A hard seek invalidates the EWMA the loop was built on.
+                eng.reset_runtime()
 
     @staticmethod
     def _at_stream_end(player: PlayerController) -> bool:
@@ -373,125 +603,138 @@ class MainWindow(QMainWindow):
         return t is not None and dur is not None and t >= dur - 1e-6
 
     def _toggle_play(self) -> None:
-        eng = self._require_engine()
-        if eng is None:
+        if not self._require_ready():
             return
-        pa, pb = self.view_a.player, self.view_b.player
-        if self._playing or pa.is_playing or pb.is_playing:
-            pa.pause()
-            pb.pause()
+        views = [self.views[vid] for vid in self.view_ids]
+        if self._playing or any(v.player.is_playing for v in views):
+            for v in views:
+                v.player.pause()
             self._playing = False
             logger.info("playback paused")
-            # mpv pauses asynchronously; re-align once both have settled.
+            # mpv pauses asynchronously; re-align once they have settled.
             QTimer.singleShot(200, self._resync_if_needed)
             return
-        lo, hi = eng.master_range()
-        try:
-            if eng.master_time() >= hi - 1e-6:
-                eng.seek_master(lo)
-        except SyncError:
-            pass  # A is mid-load (no time yet): start from wherever it is
-        # When synced, snap B onto A's aligned position before starting —
-        # but only when meaningfully off. An unconditional seek restarts
-        # B's decode pipeline (keyframe backstep plus decode forward) and
-        # visibly stalls B while A already plays; sub-frame residuals are
-        # converged by the regulate() speed loop instead.
-        if eng.state.is_complete:
-            eng.resync_if_needed()
-        pa.play()
-        pb.play()
+        rng = self._master_range()
+        master = self.views["a"].player.time_pos
+        if rng is not None and master is not None and master >= rng[1] - 1e-6:
+            self._seek_master_all(rng[0])  # all views at EOF: restart together
+        # When synced, snap followers onto A's aligned position before
+        # starting — but only when meaningfully off. An unconditional seek
+        # restarts a decode pipeline (keyframe backstep plus decode forward)
+        # and visibly stalls that view while A already plays; sub-frame
+        # residuals are converged by the regulate() speed loop instead.
+        for eng in self.engines.values():
+            if eng.ready and eng.state.is_complete:
+                eng.resync_if_needed()
+        # Never start a view that is still loading: play() would unpause it
+        # and it would begin from 0 once the file demuxes, unsynced. It
+        # joins automatically when the load completes (see _on_load_tick).
+        for v in views:
+            if v.player.meta is not None:
+                v.player.play()
         self._playing = True
         logger.info("playback started, speed=%.2f", self.config.speed)
-        # No startup resync here: a hard seek during playback restarts B's
-        # pipeline and creates the very skew it removes. The startup offset
+        # No startup resync here: a hard seek during playback restarts the
+        # pipelines and creates the very skew it removes. The startup offset
         # (~40 ms pipeline wake-up asymmetry) is converged by the speed loop.
 
     def _stop_playback(self) -> None:
-        """Pause both views (free-run playback stops; positions stay put)."""
+        """Pause all views (free-run playback stops; positions stay put)."""
         self._playing = False
-        if self.view_a.player.is_playing or self.view_b.player.is_playing:
-            self.view_a.player.pause()
-            self.view_b.player.pause()
+        if any(self.views[vid].player.is_playing for vid in self.view_ids):
+            for vid in self.view_ids:
+                self.views[vid].player.pause()
             logger.debug("playback stopped")
 
     def _resync_if_needed(self) -> None:
-        """Snap B onto A's aligned time if off by more than ~one frame."""
+        """Snap followers onto A's aligned time if off by more than ~one frame."""
         # Runs from a delayed timer after pausing: skip when playback
         # restarted in the meantime — a mid-playback hard seek is exactly
         # what the free-run design avoids.
         if self._closing or self._playing:
             return
-        eng = self.engine
         # Without sync points there is no aligned position to restore:
         # leave manually offset views alone (sync-point hunting workflow).
-        if eng is None or not eng.ready or not eng.state.is_complete:
+        if not self._any_engine_ready():
             return
-        eng.resync_if_needed()
+        for eng in self.engines.values():
+            if eng.ready and eng.state.is_complete:
+                eng.resync_if_needed()
 
     def _step(self, frames: int) -> None:
-        eng = self._require_engine()
-        if eng is not None:
-            self._stop_playback()
-            eng.step(frames)
+        if not self._require_ready():
+            return
+        self._stop_playback()
+        master = self.views["a"].player.time_pos
+        if master is None:
+            return
+        master += frames / self._reference_fps()
+        rng = self._master_range()
+        if rng is not None:
+            master = min(max(master, rng[0]), rng[1])
+        self._seek_master_all(master)
 
     def _step_view(self, view: ViewId, frames: int) -> None:
         """Step one view independently (used to find the sync frame)."""
+        if view not in self.views:
+            return
         self._stop_playback()
-        player = self.view_a.player if view == "a" else self.view_b.player
-        player.step_frames(frames)
+        self.views[view].player.step_frames(frames)
 
     def _toggle_play_view(self, view: ViewId) -> None:
         """Play/pause one view alone, for hunting the sync frame.
 
-        If both views are playing in sync, stop that first so the other view
-        stays put while this one is being positioned.
+        If views are playing in sync, stop that first so the other views
+        stay put while this one is being positioned.
         """
-        view_widget = self.view_a if view == "a" else self.view_b
-        if view_widget.player.meta is None:
+        if view not in self.views:
+            return
+        player = self.views[view].player
+        if player.meta is None:
             self.statusBar().showMessage(f"{view.upper()}: load a video first")
             return
         if self._playing:
             self._stop_playback()
-        player = view_widget.player
         player.toggle_play()
         if player.is_playing and self._at_stream_end(player):
             player.seek_exact(0.0)
             player.play()
 
     def _goto_first(self) -> None:
-        eng = self._require_engine()
-        if eng is not None:
-            self._stop_playback()
-            lo, _ = eng.master_range()
-            eng.seek_master(lo)
+        if not self._require_ready():
+            return
+        self._stop_playback()
+        rng = self._master_range()
+        if rng is not None:
+            self._seek_master_all(rng[0])
 
     def _goto_last(self) -> None:
-        eng = self._require_engine()
-        if eng is not None:
-            self._stop_playback()
-            lo, hi = eng.master_range()
-            eng.seek_master(max(lo, hi - 1.0 / eng.reference_fps))
+        if not self._require_ready():
+            return
+        self._stop_playback()
+        rng = self._master_range()
+        if rng is not None:
+            self._seek_master_all(max(rng[0], rng[1] - 1.0 / self._reference_fps()))
 
     def _on_scrub_preview(self, t: float) -> None:
         """Coarse seek while dragging; stops playback so they don't fight."""
-        eng = self._require_engine()
-        if eng is None:
+        if not self._require_ready():
             return
         self._stop_playback()
-        eng.seek_master(t, exact=False)
+        self._seek_master_all(t, exact=False)
 
     def _on_seek_committed(self, t: float) -> None:
         """Exact seek on mouse release."""
-        eng = self._require_engine()
-        if eng is not None:
-            self._stop_playback()
-            eng.seek_master(t)
+        if not self._require_ready():
+            return
+        self._stop_playback()
+        self._seek_master_all(t)
 
     def _on_speed_changed(self, index: int) -> None:
         speed = float(self.speed_combo.itemData(index))
         self.config.speed = speed
-        self.view_a.player.set_speed(speed)
-        self.view_b.player.set_speed(speed)
+        for view in self.views.values():
+            view.player.set_speed(speed)
 
     def _cycle_speed(self, direction: int) -> None:
         idx = min(len(SPEED_STEPS) - 1, max(0, self.speed_combo.currentIndex() + direction))
@@ -500,45 +743,104 @@ class MainWindow(QMainWindow):
     # -- sync ------------------------------------------------------------------
 
     def _set_active_view(self, view: str) -> None:
-        self._active_view = "a" if view == "A" else "b"
+        vid = view.lower()
+        if vid in self.views:
+            self._active_view = vid  # type: ignore[assignment]
+
+    def _current_anchors(self) -> dict[ViewId, float | None]:
+        """Anchor per view, rebuilt from the engines' sync states.
+
+        The A-side anchor is taken from the first complete pair (they are
+        normally identical; a deterministic pick beats last-wins).
+        """
+        anchors: dict[ViewId, float | None] = {vid: None for vid in self.view_ids}
+        for vid, eng in self.engines.items():
+            if eng.state.is_complete:
+                if anchors["a"] is None:
+                    anchors["a"] = eng.state.point_a
+                anchors[vid] = eng.state.point_b
+        return anchors
+
+    def _current_offsets(self) -> dict[ViewId, float]:
+        """Offsets of every synced follower pair (empty when unsynced)."""
+        return {vid: eng.offset for vid, eng in self.engines.items() if eng.state.is_complete}
+
+    def _invalidate_sync(self, view: ViewId) -> None:
+        """Drop sync anchors that involve a (re)loaded view."""
+        affected = list(self.engines) if view == "a" else [view]
+        for vid in affected:
+            eng = self.engines.get(vid)
+            if eng is not None and eng.state.is_complete:
+                eng.clear_sync()
+            follower = self.views.get(vid)
+            if follower is not None:
+                # A regulate() nudge may have left the follower at ±10%;
+                # without an anchor the loop no longer corrects it.
+                follower.player.set_speed(self.config.speed)
+        if any(vid in self.engines for vid in affected):
+            self._refresh_sync_ui()
+
+    def _refresh_sync_ui(self) -> None:
+        """Push the current sync state to the timeline and the chip."""
+        offsets = self._current_offsets()
+        self.timeline.set_anchors(self._current_anchors())
+        self.timeline.set_offsets(offsets)
+        self._set_sync_chip(offsets)
 
     def _align_current_frames(self) -> None:
-        """One-shot sync: both current frames become the anchor."""
-        eng = self._require_engine()
-        if eng is None:
+        """One-shot sync: all current frames become the anchors."""
+        if not self._require_ready():
             return
         self._stop_playback()
-        try:
-            offset = eng.sync_here()
-        except SyncError as exc:
-            logger.warning("align failed: %s", exc)
-            self.statusBar().showMessage(f"Cannot sync: {exc}")
+        offsets: dict[ViewId, float] = {}
+        error: str | None = None
+        for vid, eng in self.engines.items():
+            if not eng.ready:
+                continue
+            try:
+                offsets[vid] = eng.sync_here()
+            except SyncError as exc:
+                error = str(exc)
+        if not offsets:
+            logger.warning("align failed: %s", error)
+            self.statusBar().showMessage(f"Cannot sync: {error or 'no pair ready'}")
             return
-        lo, hi = eng.master_range()
-        self.timeline.set_anchors(eng.state.point_a, eng.state.point_b)
-        eng.seek_master(min(max(eng.master_time(), lo), hi))
-        self._set_sync_chip(offset)
-        self.statusBar().showMessage(f"Synced: offset = {offset:+.3f}s")
+        rng = self._master_range()
+        master = self.views["a"].player.time_pos
+        if rng is not None and master is not None:
+            self._seek_master_all(min(max(master, rng[0]), rng[1]))
+        self._refresh_sync_ui()
+        parts = [f"A{vid.upper()} {off:+.3f}s" for vid, off in offsets.items()]
+        self.statusBar().showMessage("Synced: " + " · ".join(parts))
 
-    def _set_sync_chip(self, offset: float | None) -> None:
-        """Update the sync state chip (None = not synced)."""
-        if offset is None:
+    def _set_sync_chip(self, offsets: dict[ViewId, float]) -> None:
+        """Update the sync state chip (empty dict = not synced)."""
+        if not offsets:
             self.sync_chip.setText("● not synced")
             self.sync_chip.setProperty("state", "off")
         else:
-            self.sync_chip.setText(f"● {offset:+.3f}s")
+            if len(offsets) == 1:
+                (off,) = offsets.values()
+                self.sync_chip.setText(f"● {off:+.3f}s")
+            else:
+                inner = " · ".join(f"A{vid.upper()} {off:+.3f}" for vid, off in offsets.items())
+                self.sync_chip.setText(f"● {inner}")
             self.sync_chip.setProperty("state", "on")
         # Force QSS re-evaluation after a dynamic property change.
         self.sync_chip.style().unpolish(self.sync_chip)
         self.sync_chip.style().polish(self.sync_chip)
 
     def _clear_sync(self) -> None:
-        if self.engine is None:
+        if not self._initialized:
             return
         self._stop_playback()
-        self.engine.clear_sync()
-        self.timeline.set_anchors(None, None)
-        self._set_sync_chip(None)
+        for eng in self.engines.values():
+            eng.clear_sync()
+        # Undo any ±10% regulate nudge: without an anchor the loop stops
+        # correcting, so a nudged follower would otherwise keep that speed.
+        for vid in self.view_ids[1:]:
+            self.views[vid].player.set_speed(self.config.speed)
+        self._refresh_sync_ui()
         self.statusBar().showMessage("Sync cleared")
 
     # -- recording ------------------------------------------------------------------
@@ -652,22 +954,24 @@ class MainWindow(QMainWindow):
         self.btn_crosshair.setChecked(not self.btn_crosshair.isChecked())
 
     def _on_crosshair_toggled(self, checked: bool) -> None:
-        """Show/hide the center crosshair on both views at once.
+        """Show/hide the center crosshair on all views at once.
 
         One shared reference mark, not per-view: the point is comparing
-        the two sides' motion against the same fixed position.
+        the views' motion against the same fixed position.
         """
         self.config.crosshair = checked
         self.config.save()
-        if self.engine is None:
+        if not self._initialized:
             return  # before initialize(); state applies on setChecked there
-        self.view_a.player.set_crosshair(checked)
-        self.view_b.player.set_crosshair(checked)
+        for view in self.views.values():
+            view.player.set_crosshair(checked)
         self.statusBar().showMessage("Crosshair on" if checked else "Crosshair off")
 
     # -- file dialog ------------------------------------------------------------------
 
     def _open_dialog(self, view: ViewId) -> None:
+        if view not in self.views:
+            return
         start = self.config.last_dir or str(Path.home())
         exts = " ".join(f"*{e}" for e in sorted(VIDEO_EXTS))
         path_str, _ = QFileDialog.getOpenFileName(
@@ -682,6 +986,8 @@ class MainWindow(QMainWindow):
     # -- timers ------------------------------------------------------------------
 
     def _on_ui_tick(self) -> None:
+        if not self._initialized:
+            return
         # Recording elapsed time on the Rec button (once per second) runs
         # before the engine guard: recording works without loaded videos.
         # Only while truly RECORDING: in STOPPING the "finishing…" label
@@ -691,44 +997,81 @@ class MainWindow(QMainWindow):
             if secs != self._rec_secs:
                 self._rec_secs = secs
                 self.btn_rec.setText(f"⏺ {secs // 60}:{secs % 60:02d}")
-        if self.engine is None:
-            return
-        try:
-            master = self.engine.master_time()
-        except SyncError:
+        a = self.views["a"].player
+        master = a.time_pos
+        if master is None:
             return  # view A not loaded yet
         # Follow each player's real state, not the global sync flag: a
         # solo-playing view must animate its own track.
-        a_playing = self.view_a.player.is_playing
-        if a_playing:
+        if a.is_playing:
             # playback-time is clock-interpolated: smoother than time_pos.
-            pt = self.view_a.player.playback_time
+            pt = a.playback_time
             if pt is not None:
                 master = pt
-        shown = self._smooth_playhead(master, a_playing)
+        shown = self._smooth_playhead(master, a.is_playing)
         # Each knob shows its own video's actual local time (so solo
         # playback moves only that track); the mapped position is a
-        # fallback while B is mid-load and reports no time yet.
-        t_b = self.view_b.player.playback_time
-        if t_b is None:
-            t_b = self.view_b.player.time_pos
-        if t_b is None:
-            t_b = self.engine.view_time("b", shown)
-        dur_b = self.view_b.player.duration
-        if dur_b is not None:
-            t_b = min(t_b, dur_b)
-        self.timeline.set_playheads(shown, t_b)
-        self._update_view_time(self.view_a)
-        self._update_view_time(self.view_b)
-        self.view_a.set_play_text(self.view_a.player.is_playing)
-        self.view_b.set_play_text(self.view_b.player.is_playing)
-        drift = self.engine.drift()
-        drift_ms = f"{drift * 1000:+.1f}ms" if drift is not None else "n/a"
-        self._status_live.setText(
-            f"A {master:8.3f}s | offset {self.engine.offset:+.3f}s | drift {drift_ms} "
-            f"| {self.engine.reference_fps:g}fps"
-        )
+        # fallback while a follower is mid-load and reports no time yet.
+        heads: dict[ViewId, float] = {"a": shown}
+        for vid in self.view_ids[1:]:
+            p = self.views[vid].player
+            t = p.playback_time
+            if t is None:
+                t = p.time_pos
+            if t is None:
+                eng = self.engines.get(vid)
+                t = eng.view_time(vid, shown) if eng is not None else shown
+            dur = p.duration
+            if dur is not None:
+                t = min(t, dur)
+            heads[vid] = t
+        self.timeline.set_playheads(heads)
+        for vid in self.view_ids:
+            self._update_view_time(self.views[vid])
+            self.views[vid].set_play_text(self.views[vid].player.is_playing)
+        self._status_live.setText(self._live_status_text(master))
         self.btn_play.setText("Pause" if self._playing else "Play")
+
+    def _live_status_text(self, master: float) -> str:
+        """Status-bar readout: exact per-pair detail until it stops fitting."""
+        fps = self._reference_fps()
+        offsets = self._current_offsets()
+        drifts = {vid: eng.drift() for vid, eng in self.engines.items() if eng.ready}
+        parts = [
+            f"A{vid.upper()} {off:+.3f}s ({self._drift_ms(drifts.get(vid))})"
+            for vid, off in offsets.items()
+        ]
+        if len(offsets) <= 1:
+            self._status_live.setToolTip("")
+            off = next(iter(offsets.values()), 0.0)
+            # Prefer the drift of the synced pair itself; fall back to any
+            # ready engine when nothing is synced (keeps the old readout).
+            synced_vid = next(iter(offsets), None)
+            drift = drifts.get(synced_vid) if synced_vid is not None else None
+            if synced_vid is None:
+                drift = next(iter(drifts.values()), None)
+            return (
+                f"A {master:8.3f}s | offset {off:+.3f}s "
+                f"| drift {self._drift_ms(drift)} | {fps:g}fps"
+            )
+        if len(offsets) == 2:
+            self._status_live.setToolTip("")
+            return f"A {master:8.3f}s | {' | '.join(parts)} | {fps:g}fps"
+        # 3 synced pairs: one line, per-pair detail in the tooltip. The
+        # worst-case figure only considers synced pairs.
+        self._status_live.setToolTip(" | ".join(parts))
+        worst = max(
+            (abs(d) for vid, d in drifts.items() if vid in offsets and d is not None),
+            default=0.0,
+        )
+        return (
+            f"A {master:8.3f}s | {len(offsets)} synced pairs "
+            f"| max drift {worst * 1000:+.1f}ms | {fps:g}fps"
+        )
+
+    @staticmethod
+    def _drift_ms(drift: float | None) -> str:
+        return f"{drift * 1000:+.1f}ms" if drift is not None else "n/a"
 
     def _smooth_playhead(self, raw: float, playing: bool) -> float:
         """Interpolate between mpv frame updates so the playhead glides."""
@@ -743,7 +1086,7 @@ class MainWindow(QMainWindow):
         # solo-playing A past the sync overlap must keep moving its knob
         # (clamping to master_range would freeze it mid-track while the
         # status bar keeps counting).
-        dur_a = self.view_a.player.duration
+        dur_a = self.views["a"].player.duration
         if dur_a is not None:
             est = min(max(est, 0.0), dur_a)
         return est
@@ -756,26 +1099,29 @@ class MainWindow(QMainWindow):
     def _on_drift_tick(self) -> None:
         """Continuous sync regulation during free-run playback.
 
-        Small drift is absorbed by nudging B's speed (up to +/-10%); a hard
-        seek fires only beyond a few frames. Community-validated approach
-        (Syncplay / mpv issue #13905 use the same scheme).
+        Small drift is absorbed by nudging the follower's speed (up to
+        +/-10%); a hard seek fires only beyond a few frames.
+        Community-validated approach (Syncplay / mpv issue #13905).
         """
-        eng = self.engine
+        if not self._initialized:
+            return
         # Heartbeat before guards: proves the timer fires even when the
         # regulation path is skipped (unloaded / paused / not synced).
         self._drift_tick_count += 1
         if self._drift_tick_count % 100 == 0:  # every ~10s at 100ms tick
             logger.info(
-                "drift tick alive: count=%d playing=%s synced=%s ready=%s",
+                "drift tick alive: count=%d playing=%s views=%d ready=%d synced=%d",
                 self._drift_tick_count,
                 self._playing,
-                eng.state.is_complete if eng else None,
-                eng.ready if eng else None,
+                len(self.view_ids),
+                sum(1 for e in self.engines.values() if e.ready),
+                sum(1 for e in self.engines.values() if e.state.is_complete),
             )
-        if eng is None or not eng.ready or not self._playing:
+        if not self._playing:
             return
-        if not eng.state.is_complete:
-            # An offset of 0 is not a sync: without an anchor, nudging B's
-            # speed would drag an intentionally offset view back onto A.
-            return
-        eng.regulate(self.config.speed)
+        for eng in self.engines.values():
+            # An offset of 0 is not a sync: without an anchor, nudging a
+            # follower's speed would drag an intentionally offset view
+            # back onto A.
+            if eng.ready and eng.state.is_complete:
+                eng.regulate(self.config.speed)

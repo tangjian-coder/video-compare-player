@@ -40,46 +40,49 @@ def pump(seconds: float) -> None:
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
+    _app = QApplication(sys.argv)  # noqa: F841 - keeps the Qt app alive
     window = MainWindow(AppConfig())
     window.show()
-    window.initialize(left=LEFT, right=RIGHT)
+    window.initialize([LEFT, RIGHT])
+    engine = window.engines["b"]
+    view_a = window.views["a"]
 
     deadline = time.monotonic() + 10.0
-    while (window.engine is None or not window.engine.ready) and time.monotonic() < deadline:
+    while not engine.ready and time.monotonic() < deadline:
         pump(0.1)
-    if window.engine is None or not window.engine.ready:
+    if not engine.ready:
         print("FAIL: videos did not become ready in time")
         return 1
-    fps_ref = window.engine.reference_fps
-    print(f"ready: fps_ref={fps_ref:.3f}, range={window.engine.master_range()}")
+    fps_ref = engine.reference_fps
+    print(f"ready: fps_ref={fps_ref:.3f}, range={engine.master_range()}")
 
     samples: list[float] = []
     sampler = QTimer()
     sampler.setInterval(50)
 
     def take_sample() -> None:
-        d = window.engine.drift() if window.engine else None
+        d = engine.drift()
         if d is not None:
             samples.append(d)
 
     sampler.timeout.connect(take_sample)
-    start_a = window.view_a.player.time_pos or 0.0
+    start_a = view_a.player.time_pos or 0.0
     sampler.start()
     window._toggle_play()  # start lockstep playback
     pump(PLAY_SECONDS)
     sampler.stop()
-    mid_a = window.view_a.player.time_pos or 0.0
+    mid_a = view_a.player.time_pos or 0.0
     window._toggle_play()  # pause
     pump(0.5)
 
-    settled = window.engine.drift()
+    settled = engine.drift()
     window.close()
 
     advanced = mid_a - start_a
     frame = 1.0 / fps_ref
     print(f"advanced during play: {advanced:.2f}s of content in {PLAY_SECONDS}s")
-    print(f"one frame = {frame * 1000:.2f}ms; settled drift after pause: {abs(settled or 0) * 1000:.2f}ms")
+    settled_ms = abs(settled or 0) * 1000
+    print(f"one frame = {frame * 1000:.2f}ms; settled drift after pause: {settled_ms:.2f}ms")
     if samples:
         ordered = sorted(abs(d) for d in samples)
         print(

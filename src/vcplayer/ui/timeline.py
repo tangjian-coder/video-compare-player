@@ -1,20 +1,22 @@
-"""Dual-track timeline: one slider per video on a shared time scale.
+"""Multi-track timeline: one slider per video on a shared time scale.
 
-Both tracks share the same seconds-to-pixels scale (span = the longer
-video), so the two knobs move at identical speed during playback and the
-two sync anchors sit horizontally apart by exactly the sync offset.
-Each track spans its own video's full duration; the tail beyond it is
-rendered as a dead zone.
+All tracks share the same seconds-to-pixels scale (span = the longest
+video), so the knobs move at identical speed during playback and each
+track's sync anchor sits at the same physical moment. Each track spans
+its own video's full duration; the tail beyond it renders as a dead
+zone. The track list is dynamic (2-4 views) and the height follows it.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Literal
+from collections.abc import Mapping, Sequence
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import QWidget
+
+from ..core.sync import ViewId
 
 SCRUB_PREVIEW_INTERVAL_S = 0.06  # min interval between scrub preview seeks
 
@@ -24,29 +26,33 @@ SCRUB_PREVIEW_INTERVAL_S = 0.06  # min interval between scrub preview seeks
 TICK_STEPS_S = (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800)
 MIN_TICK_PX = 64.0
 
-WIDGET_H = 44  # tick strip + two tracks, constant in every state
+TRACK_TOP_Y = 13.0  # top of the first track, below the tick strip
+TRACK_PITCH = 12.0  # vertical distance between track tops
 TRACK_H = 6.0
-TRACK_A_Y = 13.0  # top of the A track
-TRACK_B_Y = 25.0  # top of the B track
-TRACK_MID_Y = (TRACK_A_Y + TRACK_B_Y + TRACK_H) / 2  # hit-test boundary
+BOTTOM_PAD = 13.0  # below the last track: knob overhang + breathing room
 KNOB_R = 5.5
 
 COLOR_BG = QColor(0x1C, 0x1C, 0x1E)
 COLOR_TRACK = QColor(0x48, 0x48, 0x4A)  # active track (video has frames)
 COLOR_DEAD = QColor(0x2C, 0x2C, 0x2E)  # beyond this video's duration
-COLOR_FILL = QColor(0x0A, 0x84, 0xFF)  # played portion, system blue
 COLOR_KNOB = QColor(0xFF, 0xFF, 0xFF)
 COLOR_ANCHOR = QColor(0xFF, 0xD6, 0x0A)  # sync anchor, system yellow
 COLOR_TICK = QColor(0x48, 0x48, 0x4A)
 
-ViewId = Literal["a", "b"]
+# Played fill per view, matching the badge colors (style.py).
+TRACK_FILL: dict[ViewId, QColor] = {
+    "a": QColor(0x0A, 0x84, 0xFF),
+    "b": QColor(0x30, 0xD1, 0x58),
+    "c": QColor(0x5E, 0x5C, 0xE6),
+    "d": QColor(0xFF, 0x9F, 0x0A),
+}
 
 
 def track_x_to_master(x: float, width: float, span: float, view: ViewId, offset: float) -> float:
-    """Map a pixel on either track to master time (unclamped).
+    """Map a pixel on any track to master time (unclamped).
 
     The tracks share one seconds scale: the A track is the master axis
-    itself, the B track is shifted by the sync offset.
+    itself, every follower track is shifted by its own sync offset.
     """
     if span <= 0 or width <= 0:
         return 0.0
@@ -55,8 +61,13 @@ def track_x_to_master(x: float, width: float, span: float, view: ViewId, offset:
     return t if view == "a" else t - offset
 
 
+def tracks_height(count: int) -> int:
+    """Widget height for `count` tracks (tick strip + tracks + padding)."""
+    return round(TRACK_TOP_Y + (count - 1) * TRACK_PITCH + TRACK_H + BOTTOM_PAD)
+
+
 class TimelineWidget(QWidget):
-    """Two-slider ruler; click/drag either slider to seek both views.
+    """Multi-slider ruler; click/drag any slider to seek all views.
 
     Scrubbing emits throttled `scrub_preview` signals (coarse seeks) and
     a single `seek_committed` on release (exact seek), so dragging stays
@@ -68,13 +79,16 @@ class TimelineWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(WIDGET_H)
-        self._dur_a: float | None = None
-        self._dur_b: float | None = None
-        self._anchor_a: float | None = None
-        self._anchor_b: float | None = None
-        self._t_a = 0.0
-        self._t_b = 0.0
+        self._init_state()
+        self.setMinimumHeight(tracks_height(len(self._views)))
+
+    def _init_state(self) -> None:
+        """Plain-Python state, split out for the no-Qt test fixture."""
+        self._views: list[ViewId] = ["a", "b"]
+        self._dur: dict[ViewId, float | None] = {}
+        self._anchor: dict[ViewId, float | None] = {}
+        self._offsets: dict[ViewId, float] = {}
+        self._t: dict[ViewId, float] = {}
         self._drag_view: ViewId | None = None
         self._last_preview = 0.0
 
@@ -82,41 +96,67 @@ class TimelineWidget(QWidget):
 
     @property
     def _span(self) -> float:
-        """Shared scale: the longer of the two durations."""
-        return max(self._dur_a or 0.0, self._dur_b or 0.0)
+        """Shared scale: the longest of the loaded durations."""
+        return max((d for d in self._dur.values() if d), default=0.0)
 
-    @property
-    def _offset(self) -> float:
-        """Sync offset derived from the anchors (0 when unsynced)."""
-        if self._anchor_a is None or self._anchor_b is None:
+    def _offset(self, view: ViewId) -> float:
+        """This track's sync offset for scrub mapping (0 when unsynced).
+
+        Fed directly by the window layer from each engine's own offset, so
+        the mapping can never disagree with the chip/status readouts.
+        """
+        if view == "a":
             return 0.0
-        return self._anchor_b - self._anchor_a
+        return self._offsets.get(view, 0.0)
 
-    def set_durations(self, dur_a: float | None, dur_b: float | None) -> None:
+    def set_tracks(self, views: Sequence[ViewId]) -> None:
+        """Set the track list; state of surviving views is preserved."""
+        self._views = list(views)
+        for view in list(self._dur):
+            if view not in self._views:
+                del self._dur[view]
+                self._anchor.pop(view, None)
+                self._offsets.pop(view, None)
+                self._t.pop(view, None)
+        for view in self._views:
+            self._dur.setdefault(view, None)
+            self._anchor.setdefault(view, None)
+            self._t.setdefault(view, 0.0)
+        self.setMinimumHeight(tracks_height(len(self._views)))
+        self.update()
+
+    def set_durations(self, durs: Mapping[ViewId, float | None]) -> None:
         """Set each track's full scale; None marks an unloaded view."""
-        self._dur_a = dur_a if dur_a and dur_a > 0 else None
-        self._dur_b = dur_b if dur_b and dur_b > 0 else None
+        for view, dur in durs.items():
+            self._dur[view] = dur if dur and dur > 0 else None
         self.update()
 
-    def set_anchors(self, a: float | None, b: float | None) -> None:
-        """Place the sync anchors (both None = unsynced)."""
-        self._anchor_a = a
-        self._anchor_b = b
+    def set_anchors(self, anchors: Mapping[ViewId, float | None]) -> None:
+        """Place the sync anchors (a None value clears that anchor)."""
+        for view, anchor in anchors.items():
+            self._anchor[view] = anchor
         self.update()
 
-    def set_playheads(self, t_a: float, t_b: float) -> None:
-        """Move both knobs (each in its own video's local time)."""
-        self._t_a = t_a
-        self._t_b = t_b
+    def set_offsets(self, offsets: Mapping[ViewId, float]) -> None:
+        """Set each follower's sync offset used by scrub mapping."""
+        self._offsets = {view: off for view, off in offsets.items() if view != "a"}
+        self.update()
+
+    def set_playheads(self, times: Mapping[ViewId, float]) -> None:
+        """Move the knobs (each in its own video's local time)."""
+        for view, t in times.items():
+            self._t[view] = t
         self.update()
 
     # -- input ----------------------------------------------------------------
 
     def _view_at(self, y: float) -> ViewId:
-        return "a" if y < TRACK_MID_Y else "b"
+        """Nearest track by y; clamped to the first/last track."""
+        idx = int((y - TRACK_TOP_Y - TRACK_H / 2) / TRACK_PITCH + 0.5)
+        return self._views[min(max(idx, 0), len(self._views) - 1)]
 
     def _x_to_master(self, x: float, view: ViewId) -> float:
-        return track_x_to_master(x, float(self.width()), self._span, view, self._offset)
+        return track_x_to_master(x, float(self.width()), self._span, view, self._offset(view))
 
     def _emit_preview(self, t: float, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -146,11 +186,11 @@ class TimelineWidget(QWidget):
     # -- painting ---------------------------------------------------------------
 
     def paintEvent(self, event: QPaintEvent) -> None:
-        """Paint the two slider tracks (macOS dark palette).
+        """Paint the slider tracks (macOS dark palette).
 
         Layering per track: dead zone (full width), active track (this
-        video's duration), played fill (blue), sync anchor (yellow stem
-        + diamond), knob (white, drawn last so it rides over everything).
+        video's duration), played fill (view color), sync anchor (yellow
+        stem + diamond), knob (white, drawn last so it rides over all).
         """
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -171,15 +211,17 @@ class TimelineWidget(QWidget):
                 x = t * px_per_sec
                 painter.drawLine(QPointF(x, 2.0), QPointF(x, 9.0))
                 t += step
-            for view in ("a", "b"):
-                self._paint_track(painter, w, view, px_per_sec)
+            for i, view in enumerate(self._views):
+                y = TRACK_TOP_Y + i * TRACK_PITCH
+                self._paint_track(painter, w, view, y, px_per_sec)
         painter.end()
 
-    def _paint_track(self, painter: QPainter, w: int, view: ViewId, px_per_sec: float) -> None:
-        dur = self._dur_a if view == "a" else self._dur_b
-        t_cur = self._t_a if view == "a" else self._t_b
-        anchor = self._anchor_a if view == "a" else self._anchor_b
-        y = TRACK_A_Y if view == "a" else TRACK_B_Y
+    def _paint_track(
+        self, painter: QPainter, w: int, view: ViewId, y: float, px_per_sec: float
+    ) -> None:
+        dur = self._dur.get(view)
+        t_cur = self._t.get(view, 0.0)
+        anchor = self._anchor.get(view)
         active_w = (dur or 0.0) * px_per_sec
 
         painter.setPen(Qt.PenStyle.NoPen)
@@ -195,7 +237,7 @@ class TimelineWidget(QWidget):
             # active track into the dead zone.
             fill_w = max(min(t_cur * px_per_sec, active_w), 0.0)
             if fill_w > 0.0:
-                painter.setBrush(COLOR_FILL)
+                painter.setBrush(TRACK_FILL.get(view, TRACK_FILL["a"]))
                 painter.drawRoundedRect(
                     QRectF(0.0, y, min(max(fill_w, 6.0), active_w), TRACK_H), 3.0, 3.0
                 )

@@ -1,5 +1,5 @@
 # Launch video-compare-player with the project venv.
-# Usage: .\scripts\run.ps1 [left.mp4] [right.mp4] [--debug]
+# Usage: .\scripts\run.ps1 [a.mp4 b.mp4 c.mp4 d.mp4] [--debug]
 param(
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$CliArgs

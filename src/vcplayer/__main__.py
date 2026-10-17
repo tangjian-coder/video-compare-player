@@ -1,4 +1,4 @@
-"""CLI entry: python -m vcplayer [left.mp4] [right.mp4] [--debug]."""
+"""CLI entry: python -m vcplayer [a.mp4 b.mp4 ...] [--debug]."""
 
 from __future__ import annotations
 
@@ -40,12 +40,18 @@ def _setup_logging(debug: bool) -> None:
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments and start the application."""
     parser = argparse.ArgumentParser(
-        prog="vcplayer", description="Dual-video synchronized comparison player"
+        prog="vcplayer", description="Multi-video synchronized comparison player"
     )
-    parser.add_argument("left", nargs="?", type=Path, help="video for the left view")
-    parser.add_argument("right", nargs="?", type=Path, help="video for the right view")
+    parser.add_argument(
+        "videos",
+        nargs="*",
+        type=Path,
+        help="2-4 videos: first two fill views A/B, each extra adds a view",
+    )
     parser.add_argument("--debug", action="store_true", help="enable debug logging")
     args = parser.parse_args(argv)
+    if len(args.videos) > 4:
+        parser.error("at most 4 videos (one per view)")
 
     _setup_logging(args.debug)
     logger = logging.getLogger(__name__)
@@ -54,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     from .app import run  # deferred: Qt import after logging is up
 
     try:
-        return run(left=args.left, right=args.right)
+        return run(videos=args.videos)
     except Exception:
         # pythonw.exe has no console: without this the traceback is lost.
         logger.exception("fatal error")

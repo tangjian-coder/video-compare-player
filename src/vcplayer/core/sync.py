@@ -10,13 +10,16 @@ protocol.
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Iterable
 from typing import Literal, Protocol
 
 from .models import SyncState
 
 logger = logging.getLogger(__name__)
 
-ViewId = Literal["a", "b"]
+# "a" is the master view; b/c/d are followers (one engine per follower).
+ViewId = Literal["a", "b", "c", "d"]
 
 # regulate() tuning constants (measured; see regulate docstring).
 _EWMA_ALPHA = 0.3  # smoothing factor for drift readings
@@ -75,11 +78,15 @@ class SyncEngine:
         """Align on the two current frames: both become the sync points.
 
         One-shot replacement for the old two-step point-by-point workflow.
+        Reads both times before touching the state: a failed read must not
+        leave a half-updated (new A + old B) "complete" sync behind.
         Returns the resulting offset.
         """
-        self.state.point_a = self._require_time(self.a)
-        self.state.point_b = self._require_time(self.b)
-        self._reset_runtime()
+        point_a = self._require_time(self.a)
+        point_b = self._require_time(self.b)
+        self.state.point_a = point_a
+        self.state.point_b = point_b
+        self.reset_runtime()
         logger.info(
             "synced here: a=%.3f b=%.3f offset=%+.3f",
             self.state.point_a,
@@ -95,7 +102,7 @@ class SyncEngine:
         """
         self.state.point_a = None
         self.state.point_b = None
-        self._reset_runtime()
+        self.reset_runtime()
         logger.info("sync cleared")
 
     # -- time mapping ---------------------------------------------------------
@@ -144,6 +151,21 @@ class SyncEngine:
             self.b.seek_fast(m + self.offset)
         return m
 
+    def seek_follower(self, master: float, *, exact: bool = True) -> None:
+        """Seek only the follower to the aligned position of `master`.
+
+        The multi-view window seeks A once and calls this for every ready
+        follower, avoiding N redundant seeks of the shared master player.
+        """
+        target = master + self.offset
+        dur_b = self.b.duration
+        if dur_b is not None:
+            target = min(max(target, 0.0), dur_b)
+        if exact:
+            self.b.seek_exact(target)
+        else:
+            self.b.seek_fast(target)
+
     def force_resync(self) -> None:
         """Hard-align B onto A's aligned time right now (startup stabilizer).
 
@@ -156,6 +178,7 @@ class SyncEngine:
         if dur_b is not None:
             target = min(max(target, 0.0), dur_b)
         self.b.seek_exact(target)
+        self.reset_runtime()  # EWMA belongs to the pre-seek position
         logger.info("force resync: b -> %.3f (offset %+.3f)", target, self.offset)
 
     def resync_if_needed(self) -> bool:
@@ -203,6 +226,13 @@ class SyncEngine:
         raw = self.drift()
         if raw is None:
             return None
+        # Follower at EOF: the growing drift is A advancing, not a desync
+        # the speed loop could correct. Freeze the EWMA too, or the huge
+        # accumulated value would overshoot right after a rewind.
+        dur_b, t_b = self.b.duration, self.b.time_pos
+        if dur_b is not None and t_b is not None and t_b >= dur_b - 1e-6:
+            self._drift_ewma = None
+            return None
         self._drift_ewma = (
             raw
             if self._drift_ewma is None
@@ -245,11 +275,13 @@ class SyncEngine:
         self._last_b_speed = speed
         return True
 
-    def _reset_runtime(self) -> None:
+    def reset_runtime(self) -> None:
         """Forget regulate() state after the offset basis changes.
 
-        A stale EWMA / speed cache would steer B by the previous offset's
-        drift for ~7 ticks until the smoothing converges again.
+        A stale EWMA / speed cache would steer the follower by the previous
+        offset's drift for ~7 ticks until the smoothing converges again.
+        The window layer also calls this after external seeks: a hard seek
+        invalidates the drift reading the EWMA was built from.
         """
         self._drift_ewma = None
         self._last_b_speed = None
@@ -269,3 +301,25 @@ class SyncEngine:
         if d is None:
             raise SyncError("duration unavailable (no file loaded)")
         return d
+
+
+def intersect_master_ranges(engines: Iterable[SyncEngine]) -> tuple[float, float] | None:
+    """Intersect the ready engines' master ranges.
+
+    Returns None when no engine is ready or when the ranges do not overlap:
+    seeking a point inside a non-existent intersection would leave each
+    follower on its own clamped position, so callers must not seek then.
+    """
+    lo, hi = 0.0, math.inf
+    for eng in engines:
+        if not eng.ready:
+            continue
+        e_lo, e_hi = eng.master_range()
+        # An unbounded (e.g. live) stream does not constrain the interval.
+        if not (math.isfinite(e_lo) and math.isfinite(e_hi)):
+            continue
+        lo = max(lo, e_lo)
+        hi = min(hi, e_hi)
+    if math.isinf(hi) or lo > hi:
+        return None
+    return lo, hi

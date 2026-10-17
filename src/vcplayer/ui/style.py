@@ -158,6 +158,12 @@ QLabel#viewBadgeA {
 QLabel#viewBadgeB {
     background: #30d158;
 }
+QLabel#viewBadgeC {
+    background: #5e5ce6;
+}
+QLabel#viewBadgeD {
+    background: #ff9f0a;
+}
 QLabel#captionLabel {
     color: #98989d;
 }

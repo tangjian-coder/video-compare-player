@@ -6,6 +6,7 @@ import contextlib
 import logging
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -76,7 +77,7 @@ def _set_app_user_model_id() -> None:
         logger.warning("SetCurrentProcessExplicitAppUserModelID failed: hr=0x%08X", hr & 0xFFFFFFFF)
 
 
-def run(left: Path | None, right: Path | None) -> int:
+def run(videos: Sequence[Path] | None = None) -> int:
     """Create the Qt application and enter the event loop."""
     _prepare_libmpv_path()
     _prepare_timer_resolution()
@@ -98,7 +99,7 @@ def run(left: Path | None, right: Path | None) -> int:
     window = MainWindow(config)
     window.show()
     # Players need native windows, so initialize after show().
-    QTimer.singleShot(0, lambda: window.initialize(left=left, right=right))
+    QTimer.singleShot(0, lambda: window.initialize(videos=list(videos or [])))
 
     logger.info("entering Qt event loop")
     return app.exec()

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from vcplayer.core.sync import SyncEngine, SyncError
+from vcplayer.core.sync import SyncEngine, SyncError, intersect_master_ranges
 
 
 @dataclass
@@ -404,3 +404,109 @@ def test_reference_fps_falls_back_to_25() -> None:
     eng, a, _ = make_engine()
     a.fps = None
     assert eng.reference_fps == pytest.approx(25.0)
+
+
+# -- intersect_master_ranges ----------------------------------------------------
+
+
+def test_intersect_returns_none_when_no_engine_ready() -> None:
+    a, b, c = FakePlayer(), FakePlayer(), FakePlayer()
+    b.duration = None
+    c.duration = None
+    eng_ab, eng_ac = SyncEngine(a, b), SyncEngine(a, c)
+    assert intersect_master_ranges([eng_ab, eng_ac]) is None
+    assert intersect_master_ranges([]) is None
+
+
+def test_intersect_single_ready_engine_gives_its_range() -> None:
+    a, b = FakePlayer(), FakePlayer()
+    b.duration = 8.0
+    eng = SyncEngine(a, b)
+    assert intersect_master_ranges([eng]) == (0.0, 8.0)
+
+
+def test_intersect_two_ready_engines() -> None:
+    a, b, c = FakePlayer(), FakePlayer(), FakePlayer()
+    b.duration = 8.0  # A-B range: (0, 8)
+    eng_ab = SyncEngine(a, b)
+    c.duration = 7.0
+    eng_ac = SyncEngine(a, c)
+    eng_ac.state.point_a, eng_ac.state.point_b = 2.0, 0.0  # offset -2 -> (2, 9)
+    assert intersect_master_ranges([eng_ab, eng_ac]) == (2.0, 8.0)
+
+
+def test_intersect_skips_unready_engines() -> None:
+    a, b, c = FakePlayer(), FakePlayer(), FakePlayer()
+    b.duration = 8.0
+    eng_ab = SyncEngine(a, b)
+    c.duration = None
+    eng_ac = SyncEngine(a, c)  # unready: ignored
+    assert intersect_master_ranges([eng_ab, eng_ac]) == (0.0, 8.0)
+
+
+def test_intersect_degenerate_overlap_returns_none() -> None:
+    a, b, c = FakePlayer(), FakePlayer(), FakePlayer()
+    b.duration = 5.0
+    eng_ab = SyncEngine(a, b)  # (0, 5)
+    c.duration = 2.0
+    eng_ac = SyncEngine(a, c)
+    eng_ac.state.point_a, eng_ac.state.point_b = 6.0, 0.0  # offset -6 -> (6, 8)
+    # Disjoint ranges produce no common master position at all.
+    assert intersect_master_ranges([eng_ab, eng_ac]) is None
+
+
+def test_intersect_with_unbounded_engine_keeps_finite_bound() -> None:
+    import math
+
+    a, b, c = FakePlayer(), FakePlayer(), FakePlayer()
+    a.duration = 100.0
+    b.duration = math.inf
+    c.duration = 8.0
+    eng_ab = SyncEngine(a, b)
+    eng_ac = SyncEngine(a, c)
+    assert intersect_master_ranges([eng_ab, eng_ac]) == (0.0, 8.0)
+
+
+# -- atomic sync / follower-only seek / regulate decay -------------------------
+
+
+def test_sync_here_failure_keeps_previous_state() -> None:
+    eng, a, b = make_engine(offset_a=2.0, offset_b=5.5)
+    old_a, old_b = eng.state.point_a, eng.state.point_b
+    a.time_pos = 4.0
+    b.time_pos = None  # b is mid-load: the second read fails
+    with pytest.raises(SyncError):
+        eng.sync_here()
+    assert eng.state.point_a == old_a
+    assert eng.state.point_b == old_b
+    assert eng.offset == pytest.approx(3.5)
+
+
+def test_seek_follower_moves_only_b_and_clamps() -> None:
+    eng, a, b = make_engine(offset_a=0.0, offset_b=2.0)  # offset +2
+    b.duration = 10.0
+    eng.seek_follower(4.0)
+    assert b.seeks[-1] == pytest.approx(6.0)
+    assert a.seeks == []  # the master is never touched
+    eng.seek_follower(9.0)  # target 11 -> clamped to b's duration
+    assert b.seeks[-1] == pytest.approx(10.0)
+
+
+def test_regulate_skips_and_clears_ewma_at_follower_eof() -> None:
+    eng, a, b = make_engine()
+    b.duration = 10.0
+    b.time_pos = 10.0  # follower sits at EOF while A advances
+    a.time_pos = 15.0
+    eng._drift_ewma = 3.0
+    assert eng.regulate(1.0) is None
+    assert eng._drift_ewma is None  # stale overshoot cannot survive a rewind
+    assert b.speeds == []  # no futile speed nudge was written
+
+
+def test_force_resync_clears_runtime_cache() -> None:
+    eng, a, b = make_engine()
+    eng._drift_ewma = 0.5
+    eng._last_b_speed = 1.05
+    eng.force_resync()
+    assert eng._drift_ewma is None
+    assert eng._last_b_speed is None
