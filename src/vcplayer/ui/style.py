@@ -143,7 +143,7 @@ QLabel#syncChip[state="on"] {
 }
 QFrame#videoView {
     background: #161618;
-    border: 1px solid #2c2c2e;
+    border: 2px solid #2c2c2e;
     border-radius: 8px;
 }
 QLabel#viewBadge {
@@ -167,6 +167,10 @@ QLabel#viewBadgeD {
 QLabel#captionLabel {
     color: #98989d;
 }
+QLabel#headerGrip {
+    color: #636366;
+    padding: 0 2px;
+}
 QLabel#placeholderLabel {
     color: #5c6166;
     font-size: 13pt;
@@ -186,8 +190,23 @@ QStatusBar {
 QStatusBar QLabel {
     color: #98989d;
 }
-QSplitter::handle {
-    background: #1e1e20;
+QFrame#videoView[dragSource="true"] {
+    border: 2px dashed #636366;
+}
+QFrame#videoView[dropZone="left"] {
+    border-left-color: #0a84ff;
+}
+QFrame#videoView[dropZone="right"] {
+    border-right-color: #0a84ff;
+}
+QFrame#videoView[dropZone="top"] {
+    border-top-color: #0a84ff;
+}
+QFrame#videoView[dropZone="bottom"] {
+    border-bottom-color: #0a84ff;
+}
+QFrame#videoView[dropZone="center"] {
+    border-color: #0a84ff;
 }
 QToolTip {
     background: #2c2c2e;

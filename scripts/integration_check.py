@@ -46,13 +46,20 @@ def main() -> int:
     window.initialize([LEFT, RIGHT])
     engine = window.engines["b"]
     view_a = window.views["a"]
+    view_b = window.views["b"]
 
+    # engine.ready only needs durations; the players may still be without
+    # VideoMeta (and their first frame) at that point, and _toggle_play
+    # skips views without meta — wait for the full load before playing.
     deadline = time.monotonic() + 10.0
-    while not engine.ready and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        if engine.ready and view_a.player.meta is not None and view_b.player.meta is not None:
+            break
         pump(0.1)
-    if not engine.ready:
+    if not engine.ready or view_a.player.meta is None or view_b.player.meta is None:
         print("FAIL: videos did not become ready in time")
         return 1
+    pump(0.3)
     fps_ref = engine.reference_fps
     print(f"ready: fps_ref={fps_ref:.3f}, range={engine.master_range()}")
 

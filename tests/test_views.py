@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication
 
 from vcplayer.config import AppConfig
 from vcplayer.core.sync import SyncEngine
+from vcplayer.ui import layout as pane_layout
 from vcplayer.ui.main_window import MainWindow
 from vcplayer.ui.video_view import VideoView
 
@@ -74,8 +75,11 @@ def make_window(qapp: QApplication, n: int = 2) -> MainWindow:
         vid = ("a", "b", "c", "d")[i]
         view = VideoView(vid.upper())
         view.surface._player = FakePlayer()  # type: ignore[assignment]
+        prior = list(w.view_ids)
         w.views[vid] = view
-        w.splitter.addWidget(view)
+        w.view_host.add_view(view)
+        w._layout = pane_layout.add_view(w._layout, vid, prior)
+        w.view_host.apply_layout(w._layout)
         w.view_ids.append(vid)  # type: ignore[arg-type]
     w._initialized = True
     w._refresh_view_buttons()
@@ -92,7 +96,7 @@ def test_remove_last_view_full_bookkeeping(qapp: QApplication) -> None:
     assert "c" not in w.views
     assert "c" not in w.engines
     assert "c" not in w._load_pending
-    assert w.splitter.count() == 2
+    assert w.view_host.count == 2
     assert w.timeline._views == ["a", "b"]
     assert w._active_view == "a"  # fell back from the removed view
 
@@ -101,7 +105,7 @@ def test_remove_refuses_below_min(qapp: QApplication) -> None:
     w = make_window(qapp, n=2)
     w._remove_last_view()
     assert w.view_ids == ["a", "b"]
-    assert w.splitter.count() == 2
+    assert w.view_host.count == 2
 
 
 def test_add_view_refuses_before_initialize(qapp: QApplication) -> None:
@@ -123,13 +127,32 @@ def test_view_button_gating(qapp: QApplication) -> None:
     assert not w3._open_btns["d"].isVisibleTo(w3)
 
 
-def test_equalize_splitter_distributes_evenly(qapp: QApplication) -> None:
+def test_four_views_default_to_2x2(qapp: QApplication) -> None:
     w = make_window(qapp, n=4)
-    w.splitter.resize(1600, 400)
-    w._equalize_splitter()
-    sizes = w.splitter.sizes()
-    assert len(sizes) == 4
-    assert max(sizes) - min(sizes) <= 1
+    assert w._layout == [["a", "b"], ["c", "d"]]
+
+
+def test_drop_on_left_edge_inserts_in_target_row(qapp: QApplication) -> None:
+    w = make_window(qapp, n=4)
+    w._on_view_dropped_on("d", "a", pane_layout.ZONE_LEFT)
+    assert w._layout == [["d", "a", "b"], ["c"]]
+    assert w.view_host.count == 4
+
+
+def test_drop_on_center_swaps(qapp: QApplication) -> None:
+    w = make_window(qapp, n=4)
+    w._on_view_dropped_on("a", "d", pane_layout.ZONE_CENTER)
+    assert w._layout == [["d", "b"], ["c", "a"]]
+
+
+def test_drop_is_ignored_while_recording(qapp: QApplication) -> None:
+    class FakeRecorder:
+        recording = True
+
+    w = make_window(qapp, n=4)
+    w._recorder = FakeRecorder()  # type: ignore[assignment]
+    w._on_view_dropped_on("d", "a", pane_layout.ZONE_LEFT)
+    assert w._layout == [["a", "b"], ["c", "d"]]
 
 
 def _players(w: MainWindow) -> dict[str, FakePlayer]:
@@ -194,17 +217,19 @@ def test_toggle_play_skips_views_still_loading(qapp: QApplication) -> None:
     assert p["c"].plays == 0  # must not start from 0 once the file opens
 
 
-def test_min_size_policy_shrinks_for_four_views(qapp: QApplication) -> None:
-    w = make_window(qapp, n=4)
+def test_min_size_policy_follows_layout(qapp: QApplication) -> None:
+    w = make_window(qapp, n=4)  # default 2x2: two panes wide, two rows
     w._apply_view_size_policy()
     for view in w.views.values():
-        assert view.surface.minimumWidth() == 240
+        assert view.surface.minimumWidth() == 400
         assert view.surface.minimumHeight() == 150
     w2 = make_window(qapp, n=2)
     w2._apply_view_size_policy()
     for view in w2.views.values():
         assert view.surface.minimumWidth() == 400
         assert view.surface.minimumHeight() == 260
+    w2._set_layout([["a", "b"], ["c", "d"]])  # rejected: wrong view set
+    assert w2._layout == [["a", "b"]]
 
 
 def test_loaded_view_joins_running_synced_playback(qapp: QApplication) -> None:
@@ -235,3 +260,108 @@ def test_loaded_view_stays_paused_when_unsynced(qapp: QApplication) -> None:
     w._on_view_loaded("c", Path("x.mp4"))
     assert p["c"].seeks == []
     assert p["c"].plays == 0
+
+
+def test_drag_chip_is_compact_and_titled(qapp: QApplication) -> None:
+    view = VideoView("A")
+    pixmap = view._header._drag_pixmap()
+    assert not pixmap.isNull()
+    width = pixmap.width() / pixmap.devicePixelRatio()
+    height = pixmap.height() / pixmap.devicePixelRatio()
+    assert 140 <= width <= 220
+    assert 30 <= height <= 60
+    view.set_loaded_name("2026-01-01_take_0001_with_a_long_name.mp4")
+    assert view._header._title.endswith(".mp4")
+    assert view._caption.toolTip().endswith(".mp4")
+
+
+def test_drag_source_border_property(qapp: QApplication) -> None:
+    view = VideoView("A")
+    view.set_drag_source(True)
+    assert view.property("dragSource") == "true"
+    view.set_drag_source(False)
+    assert view.property("dragSource") == ""
+
+
+def test_host_indicator_only_for_edge_zones(qapp: QApplication) -> None:
+    w = make_window(qapp, n=4)
+    pane = w.views["a"]
+    w.view_host.set_drop_indicator(pane, pane_layout.ZONE_LEFT)
+    assert w.view_host._indicator == (pane, pane_layout.ZONE_LEFT)
+    w.view_host.set_drop_indicator(pane, pane_layout.ZONE_CENTER)
+    assert w.view_host._indicator is None
+
+
+def test_layout_change_preserves_view_identity(qapp: QApplication) -> None:
+    w = make_window(qapp, n=4)
+    ids = list(w.view_ids)
+    assert w._set_layout([["d", "c"], ["b", "a"]])
+    assert w.view_ids == ids
+    assert w.timeline._views == ids
+    assert w.view_host.views["a"] is w.views["a"]
+
+
+def test_recording_blocks_presets_and_reset(qapp: QApplication) -> None:
+    class FakeRecorder:
+        recording = True
+
+    w = make_window(qapp, n=4)
+    w._recorder = FakeRecorder()  # type: ignore[assignment]
+    assert not w._set_layout([["a", "b", "c", "d"]])
+    assert w._layout == [["a", "b"], ["c", "d"]]
+    w._reset_layout()
+    assert w._layout == [["a", "b"], ["c", "d"]]
+
+
+def test_drag_finish_clears_shortcuts_and_drop_state(qapp: QApplication) -> None:
+    w = make_window(qapp, n=4)
+    pane = w.views["a"]
+    pane.set_drag_source(True)
+    pane.set_drop_zone(pane_layout.ZONE_LEFT)
+    w.view_host._drop_pane = pane
+    w._on_layout_drag_finished()
+    assert pane.property("dragSource") == ""
+    assert pane.property("dropZone") == ""
+    assert w.view_host._indicator is None
+    assert w.view_host._drop_pane is None
+
+
+def test_real_add_remove_follows_default_layouts(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_window(qapp, n=2)
+
+    def fake_ensure_player(view: VideoView) -> Any:
+        if view.surface._player is None:
+            view.surface._player = FakePlayer()
+        return view.surface._player
+
+    monkeypatch.setattr(VideoView, "ensure_player", fake_ensure_player)
+    w._add_view()
+    assert w._layout == [["a", "b", "c"]]
+    w._add_view()
+    assert w._layout == [["a", "b"], ["c", "d"]]
+    assert w.view_host.count == 4
+    w._remove_last_view()
+    assert w._layout == [["a", "b", "c"]]
+    w._remove_last_view()
+    assert w._layout == [["a", "b"]]
+    assert w.view_host.count == 2
+
+
+def test_real_add_remove_keeps_custom_arrangement(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_window(qapp, n=3)
+    assert w._set_layout([["a", "b"], ["c"]])  # Top 2 + 1 preset
+
+    def fake_ensure_player(view: VideoView) -> Any:
+        if view.surface._player is None:
+            view.surface._player = FakePlayer()
+        return view.surface._player
+
+    monkeypatch.setattr(VideoView, "ensure_player", fake_ensure_player)
+    w._add_view()
+    assert w._layout == [["a", "b"], ["c", "d"]]
+    w._remove_last_view()
+    assert w._layout == [["a", "b"], ["c"]]

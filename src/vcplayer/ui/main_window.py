@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
@@ -28,9 +28,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
-    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -39,8 +39,10 @@ from ..config import AppConfig
 from ..core import recorder as rec
 from ..core.player import PlayerController, PlayerError
 from ..core.sync import SyncEngine, SyncError, ViewId, intersect_master_ranges
+from . import layout as pane_layout
 from .timeline import TimelineWidget
 from .video_view import VIDEO_EXTS, VideoView
+from .view_host import ViewHost
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +70,20 @@ class MainWindow(QMainWindow):
         self.view_ids: list[ViewId] = ["a", "b"]
         self.engines: dict[ViewId, SyncEngine] = {}
         self._initialized = False
+        # Row-list pane arrangement; ViewHost only moves widgets inside its
+        # own grid (never reparents: the mpv surfaces are native windows).
+        self._layout: pane_layout.Layout = pane_layout.default_layout(self.view_ids)
+        # False while the arrangement is still the untouched default; a
+        # user drag/preset flips it so add/remove preserves the layout.
+        self._layout_customized = False
+        self._drag_source: str | None = None
+        self._drag_changed = False
+        self._shortcuts: list[QShortcut] = []
 
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.view_host = ViewHost()
         for view in self.views.values():
-            self.splitter.addWidget(view)
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 1)
+            self.view_host.add_view(view)
+        self.view_host.apply_layout(self._layout)
 
         self.timeline = TimelineWidget()
 
@@ -178,7 +188,7 @@ class MainWindow(QMainWindow):
         vbox = QVBoxLayout(central)
         vbox.setContentsMargins(8, 8, 8, 8)
         vbox.setSpacing(8)
-        vbox.addWidget(self.splitter, stretch=1)
+        vbox.addWidget(self.view_host, stretch=1)
         vbox.addWidget(self.timeline)
         vbox.addLayout(transport)
         self.setCentralWidget(central)
@@ -299,6 +309,11 @@ class MainWindow(QMainWindow):
         """Connect one video block's signals and per-view buttons."""
         view.file_dropped.connect(lambda p, v=view_id: self.open_video(v, Path(p)))
         view.clicked.connect(self._set_active_view)
+        view.layout_drag_started.connect(self._on_layout_drag_started)
+        view.layout_drag_finished.connect(self._on_layout_drag_finished)
+        view.view_dropped_on.connect(self._on_view_dropped_on)
+        view.drop_zone_changed.connect(self._on_drop_zone_changed)
+        view.context_menu_requested.connect(self._on_view_context_menu)
         view.btn_step_back.clicked.connect(lambda checked=False, v=view_id: self._step_view(v, -1))
         view.btn_step_fwd.clicked.connect(lambda checked=False, v=view_id: self._step_view(v, 1))
         view.btn_play.clicked.connect(lambda checked=False, v=view_id: self._toggle_play_view(v))
@@ -332,6 +347,7 @@ class MainWindow(QMainWindow):
         sc = QShortcut(key, self)
         sc.setContext(Qt.ShortcutContext.WindowShortcut)
         sc.activated.connect(handler)
+        self._shortcuts.append(sc)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Persist config and release mpv instances."""
@@ -374,10 +390,19 @@ class MainWindow(QMainWindow):
         # recreate that handle. The view is registered up front and rolled
         # back on failure — the rollback runs before any modal dialog so the
         # nested event loop never sees the half-registered state.
+        prior_ids = list(self.view_ids)
+        old_layout = [list(row) for row in self._layout]
         self.views[vid] = view
-        self.splitter.addWidget(view)
-        self.splitter.setStretchFactor(self.splitter.indexOf(view), 1)
-        self._equalize_splitter()
+        self.view_host.add_view(view)
+        self._layout = pane_layout.add_view(
+            self._layout, vid, prior_ids, customized=self._layout_customized
+        )
+        # Minimum sizes must be updated before the grid re-activates: doing
+        # it afterwards leaves the top-level minimum stuck at the previous,
+        # possibly larger, layout until the next resize event.
+        self._apply_view_size_policy()
+        self.view_host.apply_layout(self._layout)
+        view.set_drag_enabled(not self._recording())
         try:
             view.ensure_player()
             self.engines[vid] = SyncEngine(self.views["a"].player, view.player)
@@ -386,14 +411,16 @@ class MainWindow(QMainWindow):
             view.player.set_speed(self.config.speed)
             if self.btn_crosshair.isChecked():
                 view.player.set_crosshair(True)
-        except (RuntimeError, PlayerError) as exc:
+        except (RuntimeError, PlayerError, SystemError) as exc:
             logger.warning("view %s failed to start: %s", vid, exc)
             self._destroy_view(vid)
+            self._layout = old_layout
+            self._apply_view_size_policy()
+            self.view_host.apply_layout(self._layout)
             QMessageBox.warning(self, "mpv error", str(exc))
             return
         self.view_ids.append(vid)
         self._refresh_view_buttons()
-        self._apply_view_size_policy()
         self.timeline.set_tracks(self.view_ids)
         self._timeline_durs = None  # force a refresh for the new track
         self._refresh_sync_ui()
@@ -411,12 +438,17 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Stop recording before changing views")
             return
         self._stop_playback()
+        prior_ids = list(self.view_ids)
         vid = self.view_ids[-1]
+        self._layout = pane_layout.remove_view(
+            self._layout, vid, prior_ids, customized=self._layout_customized
+        )
+        self._apply_view_size_policy()
         self._destroy_view(vid)
+        self.view_host.apply_layout(self._layout)
         if self._active_view == vid:
             self._active_view = "a"
         self._refresh_view_buttons()
-        self._apply_view_size_policy()
         self.timeline.set_tracks(self.view_ids)
         self._timeline_durs = None  # force a refresh without the dropped view
         self._refresh_sync_ui()
@@ -424,19 +456,23 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"View {vid.upper()} removed")
 
     def _apply_view_size_policy(self) -> None:
-        """Shrink per-view minimums as views are added.
+        """Shrink per-view minimums with the widest row / row count.
 
         MpvSurface enforces 400x260 by default; four of those (~1630
         logical px) exceed the usable width on scaled 1080p screens and
-        force the window off-screen (which also blocks recording).
+        force the window off-screen (which also blocks recording). A 2x2
+        grid only needs the width of a two-pane row, so the limit follows
+        the layout rather than the view count.
         """
-        count = len(self.view_ids)
-        min_w, min_h = (400, 260) if count <= 2 else (300, 200) if count == 3 else (240, 150)
+        widest = max((len(row) for row in self._layout), default=1)
+        rows = max(1, len(self._layout))
+        min_w = {1: 400, 2: 400, 3: 300, 4: 240}.get(widest, 240)
+        min_h = 260 if rows == 1 else 150
         for view in self.views.values():
             view.surface.setMinimumSize(min_w, min_h)
 
     def _destroy_view(self, vid: ViewId) -> None:
-        """Remove a view from state, layout and life (player released)."""
+        """Remove a view from state and life (player released)."""
         self.view_ids = [v for v in self.view_ids if v != vid]
         view = self.views.pop(vid, None)
         self.engines.pop(vid, None)
@@ -444,17 +480,124 @@ class MainWindow(QMainWindow):
         if view is not None:
             with contextlib.suppress(RuntimeError):
                 view.player.terminate()
-            if self.splitter.indexOf(view) >= 0:
-                view.setParent(None)
+            self.view_host.remove_view(view)
             view.deleteLater()
-        self._equalize_splitter()
 
-    def _equalize_splitter(self) -> None:
-        """Give every view the same width (keeps added views from
-        squeezing only their neighbour)."""
-        n = max(1, self.splitter.count())
-        if self.splitter.width() > 0:
-            self.splitter.setSizes([self.splitter.width() // n] * n)
+    # -- pane arrangement ------------------------------------------------------
+
+    def _set_views_drag_enabled(self, enabled: bool) -> None:
+        for view in self.views.values():
+            view.set_drag_enabled(enabled)
+
+    def _on_layout_drag_started(self, source: str) -> None:
+        # The drag runs its own nested event loop: shortcuts would still
+        # fire (Space, arrows, R, ...) while the pointer is captured.
+        self._drag_source = source
+        self._drag_changed = False
+        for shortcut in self._shortcuts:
+            shortcut.setEnabled(False)
+        self.statusBar().showMessage(
+            f"Moving view {source.upper()} — drop on an edge to insert, "
+            "center to swap · Esc cancels"
+        )
+
+    def _on_layout_drag_finished(self) -> None:
+        for shortcut in self._shortcuts:
+            shortcut.setEnabled(True)
+        for view in self.views.values():
+            view.set_drop_zone(None)
+            view.set_drag_source(False)
+        self.view_host.clear_drop_state()
+        if not self._drag_changed:
+            self.statusBar().showMessage("Layout unchanged")
+        self._drag_source = None
+
+    def _on_drop_zone_changed(self, target: str, zone: str) -> None:
+        """Live status hint for the pending drop (target/zone under the pointer)."""
+        source = self._drag_source
+        if source is None or not zone or source == target:
+            return
+        if zone == pane_layout.ZONE_CENTER:
+            message = f"Release to swap {source.upper()} with {target.upper()}"
+        else:
+            where = {
+                pane_layout.ZONE_LEFT: "left of",
+                pane_layout.ZONE_RIGHT: "right of",
+                pane_layout.ZONE_TOP: "above",
+                pane_layout.ZONE_BOTTOM: "below",
+            }.get(zone, "beside")
+            message = f"Release to insert {source.upper()} {where} {target.upper()}"
+        self.statusBar().showMessage(message)
+
+    def _on_view_dropped_on(self, source: str, target: str, zone: str) -> None:
+        if self._recording():
+            self.statusBar().showMessage("Stop recording before rearranging views")
+            return
+        if source not in self.views or target not in self.views or source == target:
+            return
+        new_layout = pane_layout.apply_zone(self._layout, source, target, zone)
+        if new_layout == self._layout:
+            return
+        if not self._set_layout(new_layout):
+            return
+        self._drag_changed = True
+        if zone == pane_layout.ZONE_CENTER:
+            message = f"View {source.upper()} swapped with {target.upper()}"
+        else:
+            where = {
+                pane_layout.ZONE_LEFT: "left of",
+                pane_layout.ZONE_RIGHT: "right of",
+                pane_layout.ZONE_TOP: "above",
+                pane_layout.ZONE_BOTTOM: "below",
+            }.get(zone, "beside")
+            message = f"View {source.upper()} inserted {where} {target.upper()}"
+        self.statusBar().showMessage(message)
+
+    def _set_layout(self, new_layout: pane_layout.Layout, *, customized: bool = True) -> bool:
+        """Apply a validated arrangement; False when nothing changed."""
+        if self._recording():
+            self.statusBar().showMessage("Stop recording before rearranging views")
+            return False
+        if not pane_layout.is_valid(new_layout, self.view_ids):
+            return False
+        candidate = [list(row) for row in new_layout]
+        if candidate == self._layout:
+            return False
+        self._layout = candidate
+        self._layout_customized = customized
+        # Update minimums first: applying the layout first would leave the
+        # window minimum stuck at the previous (possibly larger) layout.
+        self._apply_view_size_policy()
+        self.view_host.apply_layout(self._layout)
+        return True
+
+    def _reset_layout(self) -> None:
+        if self._recording():
+            self.statusBar().showMessage("Stop recording before rearranging views")
+            return
+        default = pane_layout.default_layout(self.view_ids)
+        if not self._set_layout(default, customized=False):
+            self._layout_customized = False
+            self.statusBar().showMessage("Layout reset")
+
+    def _on_view_context_menu(self, _view_id: str, global_pos: QPoint) -> None:
+        menu = QMenu(self)
+        reset = menu.addAction("Reset layout", self._reset_layout)
+        presets = pane_layout.presets(self.view_ids)
+        if presets:
+            menu.addSeparator()
+            for label, preset in presets:
+
+                def apply_preset(_checked: bool = False, p: pane_layout.Layout = preset) -> None:
+                    self._set_layout(p)
+
+                action = menu.addAction(label, apply_preset)
+                if self._recording():
+                    action.setEnabled(False)
+        if self._recording():
+            reset.setEnabled(False)
+        menu.exec(global_pos)
+        menu.deleteLater()
 
     def _refresh_view_buttons(self) -> None:
         """Show Open buttons for existing views; gate ＋/－ by the limits."""
@@ -865,7 +1008,7 @@ class MainWindow(QMainWindow):
         if self.isMinimized():
             self.statusBar().showMessage("Restore the window before recording")
             return
-        region = rec.physical_region(self.splitter)
+        region = rec.physical_region(self.view_host)
         screens = rec.screen_physical_rects()
         # Clip invisible slivers a maximized window hangs past the screen.
         region = rec.clamp_region_to_desktop(region, screens)
@@ -919,6 +1062,7 @@ class MainWindow(QMainWindow):
         if state == "recording":
             self.btn_rec.setText("⏺ 0:00")
             self._set_rec_button_active(True)
+            self._set_views_drag_enabled(False)
             if self._recorder is not None and self._recorder.output is not None:
                 self.statusBar().showMessage(f"Recording → {self._recorder.output.name}")
         elif state == "stopping":
@@ -926,6 +1070,7 @@ class MainWindow(QMainWindow):
         else:  # finished / failed
             self.btn_rec.setText("⏺ Rec")
             self._set_rec_button_active(False)
+            self._set_views_drag_enabled(True)
 
     def _set_rec_button_active(self, active: bool) -> None:
         self.btn_rec.setProperty("rec", "on" if active else "off")

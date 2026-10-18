@@ -13,19 +13,37 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QWheelEvent
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QContextMenuEvent,
+    QDrag,
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QFont,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QResizeEvent,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
 
 from ..core.player import PlayerController
+from .layout import ZONE_CENTER, zone_at
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +80,18 @@ ZOOM_STEPS = [
     8.0,  # +0.5
 ]
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts", ".m2ts", ".mts", ".m4v"}
+
+# Internal drag payload carrying the source view id. A custom MIME type
+# (rather than text/URLs) keeps pane arrangement drags separate from the
+# external video-file drops both the view and the surface accept.
+VIEW_MIME = "application/x-vcplayer-view"
+
+VIEW_BADGE_COLORS = {
+    "A": "#0a84ff",
+    "B": "#30d158",
+    "C": "#5e5ce6",
+    "D": "#ff9f0a",
+}
 
 
 def step_zoom(current: float, direction: int) -> float:
@@ -304,8 +334,32 @@ class MpvSurface(QWidget):
 
     # -- drag & drop ----------------------------------------------------------
 
+    def _owning_view(self) -> VideoView | None:
+        """The VideoView this native surface belongs to (for pane drags)."""
+        parent = self.parentWidget()
+        while parent is not None:
+            if isinstance(parent, VideoView):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+    def _owning_pane_drag(self, event: QDragEnterEvent | QDragMoveEvent | QDropEvent) -> str | None:
+        """Source view id when this is an internal pane drag, else None."""
+        mime = event.mimeData()
+        if mime is None or not mime.hasFormat(VIEW_MIME):
+            return None
+        return bytes(mime.data(VIEW_MIME).data()).decode("ascii", errors="ignore") or None
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        """Accept drops of video files."""
+        """Accept pane drags on the video area too, plus video files."""
+        source = self._owning_pane_drag(event)
+        if source is not None:
+            view = self._owning_view()
+            if view is not None:
+                if source != view.view_name.lower():
+                    view.pane_drag_move(self.mapTo(view, event.position().toPoint()), source)
+                event.acceptProposedAction()
+                return
         mime = event.mimeData()
         if mime is not None and mime.hasUrls():
             for url in mime.urls():
@@ -313,8 +367,31 @@ class MpvSurface(QWidget):
                     event.acceptProposedAction()
                     return
 
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        """Track the pane drop zone while the pointer is over the video."""
+        source = self._owning_pane_drag(event)
+        view = self._owning_view()
+        if source is None or view is None:
+            return
+        if source != view.view_name.lower():
+            view.pane_drag_move(self.mapTo(view, event.position().toPoint()), source)
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        view = self._owning_view()
+        if view is not None:
+            view.set_drop_zone(None)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: QDropEvent) -> None:
-        """Emit the dropped video path."""
+        """Forward pane drops on the video area; keep file drops local."""
+        source = self._owning_pane_drag(event)
+        view = self._owning_view()
+        if source is not None and view is not None:
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            view.pane_drag_drop(source, self.mapTo(view, event.position().toPoint()))
+            return
         mime = event.mimeData()
         if mime is None:
             return
@@ -326,27 +403,208 @@ class MpvSurface(QWidget):
                 return
 
 
+class _ElidedLabel(QLabel):
+    """Label that keeps the full text but elides it to the available width.
+
+    Narrow panes (2x2, 1x4) would otherwise demand the full file name and
+    inflate the pane's minimum width.
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full_text = text
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        super().setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt override
+        self._full_text = text
+        self.setToolTip(text)
+        self._refresh()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        width = max(0, self.width())
+        elided = self.fontMetrics().elidedText(self._full_text, Qt.TextElideMode.ElideMiddle, width)
+        super().setText(elided)
+
+
+class _HeaderBar(QWidget):
+    """Pane header: drag source for arranging, plus the context menu.
+
+    Dragging starts here (not on the video surface) so the existing
+    wheel zoom / drag pan gestures stay untouched. QDrag takes an OS-level
+    mouse grab, which also keeps the drag from leaking into those handlers.
+    """
+
+    drag_started = Signal(str)  # source view id
+    drag_finished = Signal()
+    context_menu_requested = Signal(object)  # QPoint
+
+    def __init__(self, view_name: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._view_name = view_name
+        self._title = f"View {view_name}"
+        self._press_pos: QPoint | None = None
+        self._drag_enabled = True
+        self.setToolTip(f"Drag to rearrange view {view_name} · right-click for layout presets")
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def set_title(self, title: str) -> None:
+        """Text shown on the drag chip (loaded file name or default)."""
+        self._title = title
+
+    def _idle_cursor(self) -> Qt.CursorShape:
+        return Qt.CursorShape.OpenHandCursor if self._drag_enabled else Qt.CursorShape.ArrowCursor
+
+    def set_drag_enabled(self, enabled: bool) -> None:
+        """Allow or block starting a pane drag (blocked while recording)."""
+        self._drag_enabled = enabled
+        if enabled:
+            self.setToolTip(
+                f"Drag to rearrange view {self._view_name} · right-click for layout presets"
+            )
+        else:
+            self.setToolTip(f"View {self._view_name} — stop recording to rearrange")
+        self.setCursor(self._idle_cursor())
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position().toPoint()
+            if self._drag_enabled:
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
+        if self._press_pos is None:
+            return
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._press_pos = None
+            self.setCursor(self._idle_cursor())
+            return
+        moved = (event.position().toPoint() - self._press_pos).manhattanLength()
+        if moved < QApplication.startDragDistance():
+            return
+        self._start_drag()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override
+        self._press_pos = None
+        self.setCursor(self._idle_cursor())
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # noqa: N802 - Qt override
+        self.context_menu_requested.emit(event.globalPos())
+
+    def _drag_pixmap(self) -> QPixmap:
+        """Compact dark chip with the coloured badge and the file name.
+
+        Grabbing the widget itself produced a transparent, full-width strip
+        that showed as a plain white bar under the cursor on Windows.
+        """
+        width, height = 180, 44
+        dpr = self.devicePixelRatioF()
+        pixmap = QPixmap(int(width * dpr), int(height * dpr))
+        pixmap.setDevicePixelRatio(dpr)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        body = QRectF(0.5, 1.5, width - 1.0, height - 6.0)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 70))
+        painter.drawRoundedRect(body.translated(0.0, 1.5), 9.0, 9.0)
+        painter.setBrush(QColor(44, 44, 46, 230))
+        painter.setPen(QPen(QColor("#5c5c60"), 1.0))
+        painter.drawRoundedRect(body, 9.0, 9.0)
+
+        letter = self._view_name.upper()[:1]
+        badge = QRectF(8.0, 8.0, 24.0, 24.0)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(VIEW_BADGE_COLORS.get(letter, "#0a84ff")))
+        painter.drawRoundedRect(badge, 6.0, 6.0)
+
+        badge_font = QFont(self.font())
+        badge_font.setBold(True)
+        badge_font.setPointSizeF(9.5)
+        painter.setFont(badge_font)
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, letter)
+
+        title_font = QFont(self.font())
+        title_font.setPointSizeF(8.5)
+        painter.setFont(title_font)
+        painter.setPen(QColor("#f2f2f7"))
+        metrics = painter.fontMetrics()
+        available = width - 38.0 - 18.0
+        title = metrics.elidedText(self._title, Qt.TextElideMode.ElideMiddle, int(available))
+        painter.drawText(
+            QRectF(38.0, 8.0, available, 24.0),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            title,
+        )
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#98989d"))
+        for row in range(3):
+            for col in range(2):
+                painter.drawEllipse(QPointF(width - 13.0 + col * 4.5, 14.0 + row * 5.5), 1.2, 1.2)
+        painter.end()
+        return pixmap
+
+    def _start_drag(self) -> None:
+        self._press_pos = None
+        if not self._drag_enabled:
+            return
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(VIEW_MIME, self._view_name.lower().encode("ascii"))
+        drag.setMimeData(mime)
+        drag.setPixmap(self._drag_pixmap())
+        drag.setHotSpot(QPoint(10, 10))
+        self.drag_started.emit(self._view_name.lower())
+        try:
+            drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            self.setCursor(self._idle_cursor())
+            self.drag_finished.emit()
+
+
 class VideoView(QFrame):
     """One comparison block: header (badge + filename), video, footer controls."""
 
     clicked = Signal(str)  # emits view_name
     file_dropped = Signal(str)
+    layout_drag_started = Signal(str)  # source view id
+    layout_drag_finished = Signal()
+    view_dropped_on = Signal(str, str, str)  # source, target, drop zone
+    context_menu_requested = Signal(str, object)  # view id, QPoint
+    drop_zone_changed = Signal(str, str)  # target view id, zone ("" = cleared)
 
     def __init__(self, view_name: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.view_name = view_name
         self.setObjectName("videoView")
         self.setAcceptDrops(True)  # catches drops while the placeholder is showing
+        self._drag_source_active = False
 
         self._badge = QLabel(view_name)
         # Distinct object names give A/B badges their system-blue/green fills.
         self._badge.setObjectName(f"viewBadge{view_name}")
-        self._caption = QLabel("no video")
+        self._caption = _ElidedLabel("no video")
         self._caption.setObjectName("captionLabel")
-        header = QHBoxLayout()
+        self._header = _HeaderBar(view_name, self)
+        header = QHBoxLayout(self._header)
         header.setContentsMargins(8, 6, 8, 0)
         header.addWidget(self._badge)
         header.addWidget(self._caption, stretch=1)
+        self._grip = QLabel("⠿")
+        self._grip.setObjectName("headerGrip")
+        self._grip.setToolTip("Drag the header to rearrange this pane")
+        header.addWidget(self._grip)
+        self._drop_zone_name: str | None = None
 
         self._placeholder = QLabel(f"Drop video {view_name} here\nor click Open {view_name}")
         self._placeholder.setObjectName("placeholderLabel")
@@ -399,10 +657,15 @@ class VideoView(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
-        layout.addLayout(header)
+        layout.addWidget(self._header)
         layout.addLayout(self._stack, stretch=1)
         layout.addLayout(footer)
 
+        self._header.drag_started.connect(self._on_header_drag_started)
+        self._header.drag_finished.connect(self._on_header_drag_finished)
+        self._header.context_menu_requested.connect(
+            lambda pos: self.context_menu_requested.emit(view_name.lower(), pos)
+        )
         self.surface.clicked.connect(lambda: self.clicked.emit(self.view_name))
         self.surface.file_dropped.connect(self.file_dropped)
         # The signal carries the just-written zoom value: display that
@@ -410,6 +673,23 @@ class VideoView(QFrame):
         # that can serve a stale value inside the slot call chain).
         self.surface.zoom_changed.connect(self._on_zoom_changed)
         self.btn_rotate.clicked.connect(self._on_rotate)
+
+    def _on_header_drag_started(self, source: str) -> None:
+        self.set_drag_source(True)
+        self.layout_drag_started.emit(source)
+
+    def _on_header_drag_finished(self) -> None:
+        self.set_drag_source(False)
+        self.layout_drag_finished.emit()
+
+    def set_drag_source(self, active: bool) -> None:
+        """Mark this pane as the one being dragged (dashed border)."""
+        if active == self._drag_source_active:
+            return
+        self._drag_source_active = active
+        self.setProperty("dragSource", "true" if active else "")
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def _on_zoom_changed(self, zoom: float) -> None:
         """Show the zoom factor.
@@ -449,6 +729,7 @@ class VideoView(QFrame):
     def set_loaded_name(self, name: str) -> None:
         """Show the loaded file name and switch from placeholder to video."""
         self._caption.setText(name)
+        self._header.set_title(name)
         self._stack.setCurrentWidget(self.surface)
 
     def set_time_text(self, text: str) -> None:
@@ -461,8 +742,47 @@ class VideoView(QFrame):
 
     # -- drag & drop on the container (placeholder state) -----------------------
 
+    def set_drag_enabled(self, enabled: bool) -> None:
+        """Enable/disable dragging this pane by its header."""
+        self._header.set_drag_enabled(enabled)
+
+    def set_drop_zone(self, zone: str | None) -> None:
+        """Highlight the pending drop zone (or clear it)."""
+        if zone == self._drop_zone_name:
+            return
+        self._drop_zone_name = zone
+        self.setProperty("dropZone", zone or "")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+        # The host draws the insertion line in the gap between panes.
+        notify = getattr(self.parentWidget(), "set_drop_indicator", None)
+        if callable(notify):
+            notify(self, zone)
+        self.drop_zone_changed.emit(self.view_name.lower(), zone or "")
+
+    def _drop_zone(self, pos: QPoint) -> str:
+        # Dropping on another pane's header is the most natural gesture:
+        # swap, rather than treating the header as the top edge zone.
+        if self._header.geometry().contains(pos):
+            return ZONE_CENTER
+        return zone_at(float(pos.x()), float(pos.y()), float(self.width()), float(self.height()))
+
+    @staticmethod
+    def _drag_source(event: QDragEnterEvent | QDragMoveEvent | QDropEvent) -> str | None:
+        """Decode the source view id from an internal pane drag."""
+        mime = event.mimeData()
+        if mime is None or not mime.hasFormat(VIEW_MIME):
+            return None
+        return bytes(mime.data(VIEW_MIME).data()).decode("ascii", errors="ignore") or None
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        """Accept video drops that land on the placeholder area."""
+        """Accept pane drags and video-file drops."""
+        source = self._drag_source(event)
+        if source is not None:
+            if source != self.view_name.lower():
+                event.acceptProposedAction()
+            return
         mime = event.mimeData()
         if mime is not None and mime.hasUrls():
             for url in mime.urls():
@@ -470,8 +790,40 @@ class VideoView(QFrame):
                     event.acceptProposedAction()
                     return
 
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        """Track the drop zone under the pointer for pane drags."""
+        source = self._drag_source(event)
+        if source is None:
+            return
+        self.pane_drag_move(event.position().toPoint(), source)
+        event.acceptProposedAction()
+
+    def pane_drag_move(self, pos: QPoint, source: str) -> None:
+        """Highlight the drop zone for an internal pane drag."""
+        if source == self.view_name.lower():
+            self.set_drop_zone(None)
+            return
+        self.set_drop_zone(self._drop_zone(pos))
+
+    def pane_drag_drop(self, source: str, pos: QPoint) -> None:
+        """Commit an internal pane drop at the given position."""
+        zone = self._drop_zone(pos)
+        self.set_drop_zone(None)
+        if source != self.view_name.lower():
+            self.view_dropped_on.emit(source, self.view_name.lower(), zone)
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        self.set_drop_zone(None)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: QDropEvent) -> None:
-        """Forward a dropped video path that landed on the placeholder area."""
+        """Apply a pane drop locally or forward a dropped video path."""
+        source = self._drag_source(event)
+        if source is not None:
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            self.pane_drag_drop(source, event.position().toPoint())
+            return
         mime = event.mimeData()
         if mime is None:
             return
