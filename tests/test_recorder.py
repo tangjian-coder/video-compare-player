@@ -341,33 +341,48 @@ def test_finished_zero_exit_without_file_fails(
     assert recorder.state is RecorderState.FAILED
 
 
-def test_finished_nonzero_salvages_via_repair(
+def test_finished_nonzero_starts_async_repair(
     recorder: ScreenRecorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     out = tmp_path / "clip.mp4"
     out.write_bytes(b"x" * 8192)
     recorder._out = out
     recorder._state = RecorderState.STOPPING
-    monkeypatch.setattr("vcplayer.core.recorder.repair_mp4", lambda ff, p: True)
+    started: list[tuple[Path, bool]] = []
+    monkeypatch.setattr(recorder, "_start_repair", lambda o, g: started.append((o, g)))
+    recorder._on_proc_finished(1, QProcess.ExitStatus.NormalExit)
+    assert started == [(out, True)]
+    # The recorder stays busy until the remux process finishes.
+    assert recorder.state is RecorderState.STOPPING
+
+
+def test_repair_success_finishes_and_saves(recorder: ScreenRecorder, tmp_path: Path) -> None:
+    out = tmp_path / "clip.mp4"
+    out.write_bytes(b"x" * 8192)
+    fixed = out.with_suffix(".fixed.mp4")
+    fixed.write_bytes(b"y" * 8192)
+    recorder._repair_out = out
+    recorder._repair_fixed = fixed
+    recorder._state = RecorderState.STOPPING
     got: list[str] = []
     recorder.saved.connect(got.append)
-    recorder._on_proc_finished(1, QProcess.ExitStatus.NormalExit)
+    recorder._on_repair_finished(0, QProcess.ExitStatus.NormalExit)
     assert got == [str(out)]
     assert recorder.state is RecorderState.FINISHED
+    assert out.read_bytes() == b"y" * 8192
 
 
-def test_finished_nonzero_failure_deletes_and_fails(
-    recorder: ScreenRecorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_repair_failure_deletes_and_fails(recorder: ScreenRecorder, tmp_path: Path) -> None:
     out = tmp_path / "clip.mp4"
     out.write_bytes(b"x" * 8192)
-    recorder._out = out
+    recorder._repair_out = out
+    recorder._repair_fixed = out.with_suffix(".fixed.mp4")
     recorder._state = RecorderState.STOPPING
-    monkeypatch.setattr("vcplayer.core.recorder.repair_mp4", lambda ff, p: False)
+    recorder._repair_graceful = True
     errors: list[str] = []
     recorder.error.connect(errors.append)
-    recorder._on_proc_finished(1, QProcess.ExitStatus.NormalExit)
-    assert errors
+    recorder._finish_repair(False)
+    assert errors == ["finalization failed"]
     assert recorder.state is RecorderState.FAILED
     assert not out.exists()
 
@@ -434,10 +449,10 @@ def test_verdict_exception_forces_failed_not_stuck(
     recorder._out = out
     recorder._state = RecorderState.STOPPING
 
-    def _boom(ffmpeg: Path, path: Path) -> bool:
+    def _boom(out: Path, graceful: bool) -> None:
         raise TimeoutError("repair timed out")
 
-    monkeypatch.setattr("vcplayer.core.recorder.repair_mp4", _boom)
+    monkeypatch.setattr(recorder, "_start_repair", _boom)
     errors: list[str] = []
     recorder.error.connect(errors.append)
     recorder._on_proc_finished(1, QProcess.ExitStatus.NormalExit)

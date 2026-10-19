@@ -375,12 +375,14 @@ class PlayerController:
         playres = _osd_dims_to_playres(dims)
         if playres == self._last_cross_dims:
             return  # pane size unchanged: the same push is a no-op
+        # Cap the arms so the cross still fits in short stacked panes.
+        arm = int(min(_CROSSHAIR_ARM_PX, max(4.0, cx - 8.0), max(4.0, cy - 8.0)))
         try:
             self._mpv.command(
                 "osd-overlay",
                 id=_CROSSHAIR_OSD_ID,
                 format="ass-events",
-                data=build_crosshair_ass(cx, cy),
+                data=build_crosshair_ass(cx, cy, arm),
                 res_x=playres[0],
                 res_y=playres[1],
             )

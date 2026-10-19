@@ -14,12 +14,16 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # before QApplication
 from typing import Any
 
 import pytest
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QMouseEvent, QPointingDevice
 from PySide6.QtWidgets import QApplication
 
 from vcplayer.config import AppConfig
+from vcplayer.core.player import PlayerError
 from vcplayer.core.sync import SyncEngine
 from vcplayer.ui import layout as pane_layout
 from vcplayer.ui.main_window import MainWindow
+from vcplayer.ui.timeline import TimelineWidget
 from vcplayer.ui.video_view import VideoView
 
 
@@ -32,6 +36,7 @@ class FakePlayer:
         self.duration: float | None = None
         self.time_pos: float | None = 0.0
         self.fps: float | None = 60.0
+        self.rotation = 0
         self.playback_time: float | None = None
         self.seeks: list[float] = []
         self.fast_seeks: list[float] = []
@@ -51,6 +56,9 @@ class FakePlayer:
         self.speeds.append(speed)
 
     def set_crosshair(self, enabled: bool) -> None: ...
+
+    def rotate_cw(self) -> None:
+        self.rotation = (self.rotation + 90) % 360
 
     def seek_exact(self, t: float) -> None:
         self.seeks.append(t)
@@ -76,11 +84,10 @@ def make_window(qapp: QApplication, n: int = 2) -> MainWindow:
         view = VideoView(vid.upper())
         view.surface._player = FakePlayer()  # type: ignore[assignment]
         prior = list(w.view_ids)
-        w.views[vid] = view
+        w._view_set.add(view)
         w.view_host.add_view(view)
         w._layout = pane_layout.add_view(w._layout, vid, prior)
         w.view_host.apply_layout(w._layout)
-        w.view_ids.append(vid)  # type: ignore[arg-type]
     w._initialized = True
     w._refresh_view_buttons()
     w.timeline.set_tracks(w.view_ids)
@@ -120,11 +127,11 @@ def test_view_button_gating(qapp: QApplication) -> None:
     assert w.btn_add.isEnabled() and not w.btn_remove.isEnabled()
     w2 = make_window(qapp, n=4)
     assert not w2.btn_add.isEnabled() and w2.btn_remove.isEnabled()
-    for _vid, btn in w2._open_btns.items():
-        assert btn.isVisibleTo(w2) is True
+    for _vid, action in w2._open_actions.items():
+        assert action.isEnabled()
     w3 = make_window(qapp, n=3)
-    assert w3._open_btns["a"].isVisibleTo(w3)
-    assert not w3._open_btns["d"].isVisibleTo(w3)
+    assert w3._open_actions["a"].isEnabled()
+    assert not w3._open_actions["d"].isEnabled()
 
 
 def test_four_views_default_to_2x2(qapp: QApplication) -> None:
@@ -150,7 +157,7 @@ def test_drop_is_ignored_while_recording(qapp: QApplication) -> None:
         recording = True
 
     w = make_window(qapp, n=4)
-    w._recorder = FakeRecorder()  # type: ignore[assignment]
+    w._rec_controller._recorder = FakeRecorder()  # type: ignore[assignment]
     w._on_view_dropped_on("d", "a", pane_layout.ZONE_LEFT)
     assert w._layout == [["a", "b"], ["c", "d"]]
 
@@ -306,7 +313,7 @@ def test_recording_blocks_presets_and_reset(qapp: QApplication) -> None:
         recording = True
 
     w = make_window(qapp, n=4)
-    w._recorder = FakeRecorder()  # type: ignore[assignment]
+    w._rec_controller._recorder = FakeRecorder()  # type: ignore[assignment]
     assert not w._set_layout([["a", "b", "c", "d"]])
     assert w._layout == [["a", "b"], ["c", "d"]]
     w._reset_layout()
@@ -365,3 +372,206 @@ def test_real_add_remove_keeps_custom_arrangement(
     assert w._layout == [["a", "b"], ["c", "d"]]
     w._remove_last_view()
     assert w._layout == [["a", "b"], ["c"]]
+
+
+def test_rotation_angle_uses_reserved_label(qapp: QApplication) -> None:
+    view = VideoView("A")
+    view.surface._player = FakePlayer()  # type: ignore[assignment]
+    view._set_rotate_text()
+    assert view._rotation_label.text() == ""
+    assert view.btn_rotate.text() == ""
+    view._on_rotate()
+    assert view._rotation_label.text() == "90°"
+    assert view.btn_rotate.text() == ""
+    view._on_rotate()
+    assert view._rotation_label.text() == "180°"
+    assert view._rotation_label.width() == 30
+
+
+def test_pane_hover_signal_is_deduplicated(qapp: QApplication) -> None:
+    view = VideoView("A")
+    seen: list[tuple[str, bool]] = []
+    view.hover_changed.connect(lambda vid, hovered: seen.append((vid, hovered)))
+    view._set_hovered(True)
+    view._set_hovered(True)
+    view._set_hovered(False)
+    assert seen == [("a", True), ("a", False)]
+
+
+def test_track_hover_sets_pane_property(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    w._on_track_hovered("b")
+    assert w.views["b"].property("trackHover") == "true"
+    assert w.views["a"].property("trackHover") == ""
+    w._on_track_hovered(None)
+    assert all(view.property("trackHover") == "" for view in w.views.values())
+
+
+def test_view_hover_drives_timeline(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    w._on_view_hover_changed("b", True)
+    assert w.timeline.hovered_view_id == "b"
+    w._on_view_hover_changed("b", False)
+    assert w.timeline.hovered_view_id is None
+    w._drag_source = "a"
+    w._on_view_hover_changed("b", True)
+    assert w.timeline.hovered_view_id is None
+
+
+def test_add_view_rolls_back_on_unexpected_error(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_window(qapp, n=2)
+    before_views = dict(w.views)
+    before_layout = [list(row) for row in w._layout]
+    before_ids = list(w.view_ids)
+    monkeypatch.setattr(
+        VideoView, "ensure_player", lambda self: (_ for _ in ()).throw(OSError("boom"))
+    )
+    monkeypatch.setattr("vcplayer.ui.main_window.QMessageBox.warning", lambda *a, **k: None)
+    w._add_view()
+    assert w.view_ids == before_ids
+    assert w.views.keys() == before_views.keys()
+    assert w._layout == before_layout
+    assert w.view_host.count == 2
+    assert w.engines == {}
+
+
+def test_failed_open_preserves_sync(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import Path
+
+    w = make_window(qapp, n=2)
+    p = _players(w)
+    p["a"].duration, p["b"].duration = 10.0, 10.0
+    w.engines["b"] = SyncEngine(p["a"], p["b"])
+    w.engines["b"].state.point_a = 1.0
+    w.engines["b"].state.point_b = 2.0
+    monkeypatch.setattr(
+        p["b"],
+        "load",
+        lambda path: (_ for _ in ()).throw(PlayerError("missing")),
+        raising=False,
+    )
+    monkeypatch.setattr("vcplayer.ui.main_window.QMessageBox.warning", lambda *a, **k: None)
+    w.open_video("b", Path("missing.mp4"))
+    assert w.engines["b"].state.is_complete
+    assert "b" not in w._load_pending
+
+
+def test_recording_blocks_open_hover_and_open_actions(qapp: QApplication) -> None:
+    from pathlib import Path
+
+    class FakeRecorder:
+        recording = True
+
+    w = make_window(qapp, n=3)
+    w._rec_controller._recorder = FakeRecorder()  # type: ignore[assignment]
+    w._refresh_view_buttons()
+    assert not any(action.isEnabled() for action in w._open_actions.values())
+    w._on_view_hover_changed("a", True)
+    assert w.timeline.hovered_view_id is None
+    w._on_track_hovered("a")
+    assert w.views["a"].property("trackHover") != "true"
+    w.open_video("a", Path("x.mp4"))
+    assert not w._load_pending
+
+
+def test_timeline_tracks_and_hover_reset_on_remove(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    w.timeline.set_hovered_view("c")
+    w._on_track_hovered("c")
+    w._remove_last_view()
+    assert w.timeline.hovered_view_id is None
+    assert w._track_hovered is None
+    assert all(view.property("trackHover") != "true" for view in w.views.values())
+
+
+def test_timeline_mouse_tracking_and_key_filtering(qapp: QApplication) -> None:
+    t = TimelineWidget()
+    assert t.hasMouseTracking()
+    t.set_tracks(["a", "b"])
+    t.set_durations({"a": 10.0, "x": 99.0})
+    t.set_anchors({"x": 1.0})
+    t.set_offsets({"x": 1.0})
+    t.set_playheads({"x": 1.0})
+    assert "x" not in t._dur and "x" not in t._anchor
+    assert "x" not in t._offsets and "x" not in t._t
+    assert t._span == 10.0
+    t.set_hovered_view("b")
+    t.set_tracks(["a"])  # drops b and its highlight
+    assert t.hovered_view_id is None
+
+
+def test_timeline_move_event_drives_hover(qapp: QApplication) -> None:
+    t = TimelineWidget()
+    t.set_tracks(["a", "b"])
+    seen: list[str | None] = []
+    t.hovered_view.connect(seen.append)
+    y = 20.0  # inside the first track row
+    event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(100.0, y),
+        QPointF(100.0, y),
+        QPointF(100.0, y),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        QPointingDevice.primaryPointingDevice(),
+    )
+    t.mouseMoveEvent(event)
+    assert seen and seen[-1] in ("a", "b")
+    t.leaveEvent(QEvent(QEvent.Type.Leave))
+    assert seen[-1] is None
+
+
+def test_view_set_owns_order_and_active(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    assert w.view_ids == ["a", "b", "c"]
+    w._set_active_view("b")
+    assert w._active_view == "b"
+    assert w.views["b"].property("activePane") == "true"
+    assert w.views["a"].property("activePane") == ""
+    w._remove_last_view()  # active b survives, c is gone
+    assert w.view_ids == ["a", "b"]
+    assert w._active_view == "b"
+
+
+def test_empty_a_still_updates_followers(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    p = _players(w)
+    p["a"].time_pos = None
+    p["b"].time_pos = 5.0
+    p["b"].is_playing = True
+    w._on_ui_tick()
+    assert w.views["b"]._time_label.text() == "5.000s"
+    assert w._status_live.text() == "A not loaded"
+
+
+def test_initialize_wires_views_and_engines(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_ensure_player(view: VideoView) -> Any:
+        if view.surface._player is None:
+            view.surface._player = FakePlayer()
+        return view.surface._player
+
+    monkeypatch.setattr(VideoView, "ensure_player", fake_ensure_player)
+    monkeypatch.setattr("vcplayer.ui.main_window.rec.warm_up_probe", lambda: None)
+    monkeypatch.setattr(AppConfig, "save", lambda self: None)
+    w = MainWindow(AppConfig())
+    w.initialize([])
+    assert w.view_ids == ["a", "b"]
+    assert "b" in w.engines
+    assert w.timeline._views == ["a", "b"]
+    assert w._initialized
+    w.close()
+
+
+def test_close_clears_pending_loads(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import Path
+
+    monkeypatch.setattr(AppConfig, "save", lambda self: None)
+    w = make_window(qapp, n=2)
+    w._load_pending["b"] = (Path("x.mp4"), 0)
+    w.close()
+    assert w._load_pending == {}

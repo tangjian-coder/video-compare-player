@@ -16,21 +16,22 @@ import logging
 import os
 import subprocess
 import threading
-import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import cast
 
-from PySide6.QtCore import QPoint, Qt, QTimer
-from PySide6.QtGui import QCloseEvent, QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut, QShowEvent
 from PySide6.QtWidgets import (
-    QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -38,11 +39,19 @@ from PySide6.QtWidgets import (
 from ..config import AppConfig
 from ..core import recorder as rec
 from ..core.player import PlayerController, PlayerError
-from ..core.sync import SyncEngine, SyncError, ViewId, intersect_master_ranges
+from ..core.sync import SyncEngine, ViewId
 from . import layout as pane_layout
+from .icons import make_icon
+from .pane_drag import VIDEO_EXTS
+from .recording_controller import RecordingController
+from .status_presenter import PlayheadSmoother, format_live_status
+from .sync_session import SyncSession
 from .timeline import TimelineWidget
-from .video_view import VIDEO_EXTS, VideoView
+from .video_view import VideoView
 from .view_host import ViewHost
+from .view_set import ViewSet
+from .widgets import ChevronComboBox
+from .win_chrome import apply_dark_title_bar
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +75,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("video-compare-player")
         self.resize(config.window.width, config.window.height)
 
-        self.views: dict[ViewId, VideoView] = {"a": VideoView("A"), "b": VideoView("B")}
-        self.view_ids: list[ViewId] = ["a", "b"]
-        self.engines: dict[ViewId, SyncEngine] = {}
+        self._view_set = ViewSet([VideoView("A"), VideoView("B")])
+        self._sync = SyncSession(lambda: self.views)
         self._initialized = False
         # Row-list pane arrangement; ViewHost only moves widgets inside its
         # own grid (never reparents: the mpv surfaces are native windows).
@@ -77,53 +85,78 @@ class MainWindow(QMainWindow):
         # user drag/preset flips it so add/remove preserves the layout.
         self._layout_customized = False
         self._drag_source: str | None = None
+        self._track_hovered: ViewId | None = None
         self._drag_changed = False
         self._shortcuts: list[QShortcut] = []
 
         self.view_host = ViewHost()
-        for view in self.views.values():
+        for view in self._view_set.views.values():
             self.view_host.add_view(view)
         self.view_host.apply_layout(self._layout)
+        self._rec_controller = RecordingController(self, self.view_host, self)
 
         self.timeline = TimelineWidget()
+        self.timeline.setObjectName("timeline")
+        self.timeline.set_tracks(self.view_ids)
 
-        self.btn_first = QPushButton("|<")
-        self.btn_step_back = QPushButton("<")
-        self.btn_play = QPushButton("Play")
+        self.btn_first = self._icon_button("skip-start", "Go to start (Home)")
+        self.btn_step_back = self._icon_button("step-back", "Step all views back one frame (←)")
+        self.btn_step_fwd = self._icon_button("step-fwd", "Step all views forward one frame (→)")
+        self.btn_last = self._icon_button("skip-end", "Go to end (End)")
+        self.btn_play = QPushButton()
         self.btn_play.setObjectName("playButton")
-        self.btn_step_fwd = QPushButton(">")
-        self.btn_last = QPushButton(">|")
-        # Buttons must not keep focus: a focused button is re-activated by
-        # Space/Enter, double-triggering shortcuts (e.g. Space toggles play
-        # via QShortcut AND clicks the focused Play button). NoFocus keeps
-        # mouse interaction but drops all buttons from key delivery.
-        for btn in (
-            self.btn_first,
-            self.btn_step_back,
-            self.btn_play,
-            self.btn_step_fwd,
-            self.btn_last,
-        ):
+        self.btn_play.setIcon(make_icon("play", "#ffffff"))
+        self.btn_play.setIconSize(QSize(18, 18))
+        self.btn_play.setToolTip("Play (Space)")
+        self.btn_play.setAccessibleName("Play")
+        self.btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        for btn in (self.btn_first, self.btn_step_back, self.btn_step_fwd, self.btn_last):
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.speed_combo = QComboBox()
+
+        self.speed_combo = ChevronComboBox()
         for s in SPEED_STEPS:
             self.speed_combo.addItem(f"{s:g}x", s)
         self.speed_combo.setCurrentIndex(
             SPEED_STEPS.index(config.speed) if config.speed in SPEED_STEPS else 3
         )
-        self._open_btns: dict[ViewId, QPushButton] = {}
+        self.speed_combo.setToolTip("Playback speed for all views (↑/↓)")
+
+        self._open_actions: dict[ViewId, QAction] = {}
+        self.btn_open = QToolButton()
+        self.btn_open.setObjectName("toolButton")
+        self.btn_open.setText("Open")
+        self.btn_open.setIcon(make_icon("folder"))
+        self.btn_open.setIconSize(QSize(16, 16))
+        self.btn_open.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn_open.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.btn_open.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_open.setToolTip("Open a video for a view (Ctrl+O opens the active one)")
+        open_menu = QMenu(self.btn_open)
         for vid in ALL_VIEW_IDS:
-            btn = QPushButton(f"Open {vid.upper()}")
-            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            self._open_btns[vid] = btn
-        self.btn_add = QPushButton("＋")
-        self.btn_add.setObjectName("addViewButton")
-        self.btn_add.setToolTip("Add another comparison view. (V)")
-        self.btn_remove = QPushButton("－")
-        self.btn_remove.setObjectName("removeViewButton")
-        self.btn_remove.setToolTip("Remove the last view.")
-        self.btn_align = QPushButton("⇄ Align current frames")
+            action = open_menu.addAction(f"Open {vid.upper()}…")
+            action.triggered.connect(lambda _=False, v=vid: self._open_dialog(v))
+            self._open_actions[vid] = action
+        self.btn_open.setMenu(open_menu)
+
+        self.btn_layout = QToolButton()
+        self.btn_layout.setObjectName("toolButton")
+        self.btn_layout.setText("Layout")
+        self.btn_layout.setIcon(make_icon("layout"))
+        self.btn_layout.setIconSize(QSize(16, 16))
+        self.btn_layout.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn_layout.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.btn_layout.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_layout.setToolTip("Arrange the panes (or drag a pane header)")
+        layout_menu = QMenu(self.btn_layout)
+        layout_menu.aboutToShow.connect(lambda: self._populate_layout_menu(layout_menu))
+        self.btn_layout.setMenu(layout_menu)
+
+        self.btn_add = self._icon_button("plus", "Add another comparison view (V)")
+        self.btn_remove = self._icon_button("minus", "Remove the last view")
+        self.btn_align = QPushButton("Align")
         self.btn_align.setObjectName("alignButton")
+        self.btn_align.setIcon(make_icon("swap", "#a9a7ff"))
+        self.btn_align.setIconSize(QSize(16, 16))
         self.btn_align.setToolTip(
             "Step each video to the same physical moment (e.g. stopwatch tick),\n"
             "then click this: all current frames become the sync anchors. (S)"
@@ -131,16 +164,23 @@ class MainWindow(QMainWindow):
         self.sync_chip = QLabel("● not synced")
         self.sync_chip.setObjectName("syncChip")
         self.sync_chip.setProperty("state", "off")
-        self.btn_sync_clear = QPushButton("Clear sync")
+        self.btn_sync_clear = QPushButton("Clear")
         self.btn_sync_clear.setObjectName("syncButton")
-        self.btn_rec = QPushButton("⏺ Rec")
+        self.btn_sync_clear.setIcon(make_icon("x", "#a1a1a6"))
+        self.btn_sync_clear.setIconSize(QSize(14, 14))
+        self.btn_sync_clear.setToolTip("Clear all sync points (R)")
+        self.btn_rec = QPushButton("Rec")
         self.btn_rec.setObjectName("recButton")
+        self.btn_rec.setIcon(make_icon("record", "#ff453a"))
+        self.btn_rec.setIconSize(QSize(14, 14))
         self.btn_rec.setToolTip(
             "Record the video views to an mp4 clip. (F9)\n"
             "Do not move or resize the window while recording."
         )
-        self.btn_crosshair = QPushButton("✛")
+        self.btn_crosshair = QPushButton()
         self.btn_crosshair.setObjectName("crosshairButton")
+        self.btn_crosshair.setIcon(make_icon("crosshair", "#ff9f0a"))
+        self.btn_crosshair.setIconSize(QSize(16, 16))
         self.btn_crosshair.setCheckable(True)
         self.btn_crosshair.setToolTip(
             "Show a crosshair at the center of every view,\n"
@@ -158,58 +198,66 @@ class MainWindow(QMainWindow):
         ):
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        transport = QHBoxLayout()
+        transport_bar = QFrame()
+        transport_bar.setObjectName("transportBar")
+        transport = QHBoxLayout(transport_bar)
+        transport.setContentsMargins(12, 6, 12, 8)
+        transport.setSpacing(6)
+        left_group = QHBoxLayout()
+        left_group.setSpacing(6)
+        left_group.addWidget(self.btn_open)
+        left_group.addWidget(self.btn_layout)
+        left_group.addWidget(self._separator())
+        left_group.addWidget(self.btn_add)
+        left_group.addWidget(self.btn_remove)
+        transport.addLayout(left_group)
         transport.addStretch(1)
-        for vid in ALL_VIEW_IDS:
-            transport.addWidget(self._open_btns[vid])
-        transport.addWidget(self.btn_add)
-        transport.addWidget(self.btn_remove)
-        transport.addSpacing(24)
-        transport.addWidget(self.btn_first)
-        transport.addWidget(self.btn_step_back)
-        transport.addWidget(self.btn_play)
-        transport.addWidget(self.btn_step_fwd)
-        transport.addWidget(self.btn_last)
-        transport.addSpacing(24)
-        transport.addWidget(QLabel("speed"))
-        transport.addWidget(self.speed_combo)
-        transport.addSpacing(24)
-        transport.addWidget(self.btn_align)
-        transport.addWidget(self.sync_chip)
-        transport.addSpacing(12)
-        transport.addWidget(self.btn_sync_clear)
-        transport.addSpacing(12)
-        transport.addWidget(self.btn_rec)
-        transport.addWidget(self.btn_crosshair)
+        center_group = QHBoxLayout()
+        center_group.setSpacing(2)
+        center_group.addWidget(self.btn_first)
+        center_group.addWidget(self.btn_step_back)
+        center_group.addWidget(self.btn_play)
+        center_group.addWidget(self.btn_step_fwd)
+        center_group.addWidget(self.btn_last)
+        transport.addLayout(center_group)
         transport.addStretch(1)
+        right_group = QHBoxLayout()
+        right_group.setSpacing(8)
+        right_group.addWidget(self.speed_combo)
+        right_group.addWidget(self._separator())
+        right_group.addWidget(self.btn_align)
+        right_group.addWidget(self.sync_chip)
+        right_group.addWidget(self.btn_sync_clear)
+        right_group.addWidget(self.btn_rec)
+        right_group.addWidget(self.btn_crosshair)
+        transport.addLayout(right_group)
 
         central = QWidget()
         central.setObjectName("centralContainer")
         vbox = QVBoxLayout(central)
-        vbox.setContentsMargins(8, 8, 8, 8)
-        vbox.setSpacing(8)
+        vbox.setContentsMargins(12, 12, 12, 12)
+        vbox.setSpacing(10)
         vbox.addWidget(self.view_host, stretch=1)
         vbox.addWidget(self.timeline)
-        vbox.addLayout(transport)
+        vbox.addWidget(transport_bar)
         self.setCentralWidget(central)
 
-        self._active_view: ViewId = "a"
+        self._active_view = "a"
         self._load_pending: dict[ViewId, tuple[Path, int]] = {}
         # Playhead smoothing state: interpolate between mpv frame updates.
-        self._playhead_raw = 0.0
-        self._playhead_anchor = 0.0
-        self._playhead_mono = 0.0
+        self._playhead = PlayheadSmoother()
         self._playing = False
+        self._play_icon_state: bool | None = None
         self._closing = False
         self._drift_tick_count = 0
         # Live readout lives in a permanent widget: showMessage() stays free
         # for event messages ("Synced: ..."), which would otherwise be
         # clobbered by the 15 ms UI tick.
         self._status_live = QLabel("")
+        self._status_live.setObjectName("statusLive")
         self.statusBar().addPermanentWidget(self._status_live)
         self._timeline_durs: dict[ViewId, float | None] | None = None
         # Screen recorder session (created on first F9/Rec click).
-        self._recorder: rec.ScreenRecorder | None = None
         self._rec_secs = -1  # last elapsed second shown on the button
 
         self._ui_timer = QTimer(self)
@@ -220,6 +268,31 @@ class MainWindow(QMainWindow):
         self._load_timer.timeout.connect(self._on_load_tick)
 
         self._refresh_view_buttons()
+        self._set_active_view("a")
+
+    @property
+    def views(self) -> dict[ViewId, VideoView]:
+        """Snapshot of the ordered view registry (single source: ViewSet)."""
+        return self._view_set.views
+
+    @property
+    def view_ids(self) -> list[ViewId]:
+        """View ids in display/track order, derived from the registry."""
+        return self._view_set.ids
+
+    @property
+    def engines(self) -> dict[ViewId, SyncEngine]:
+        """Follower engines owned by the sync session."""
+        return self._sync.engines
+
+    @property
+    def _active_view(self) -> ViewId:
+        active = self._view_set.active
+        return active if active is not None else "a"
+
+    @_active_view.setter
+    def _active_view(self, view: ViewId) -> None:
+        self._view_set.active = view
 
     # -- lifecycle --------------------------------------------------------------
 
@@ -230,7 +303,9 @@ class MainWindow(QMainWindow):
         try:
             self.views["a"].ensure_player()
             self.views["b"].ensure_player()
-            self.engines["b"] = SyncEngine(self.views["a"].player, self.views["b"].player)
+            self.engines["b"] = SyncEngine(
+                self.views[self._sync.master].player, self.views["b"].player
+            )
         except (RuntimeError, PlayerError) as exc:
             QMessageBox.critical(self, "mpv error", str(exc))
             self.close()  # never leave a dead, unresponsive window on screen
@@ -242,9 +317,12 @@ class MainWindow(QMainWindow):
         self._connect_gestures(self.views["b"])
         self.timeline.scrub_preview.connect(self._on_scrub_preview)
         self.timeline.seek_committed.connect(self._on_seek_committed)
+        self.timeline.hovered_view.connect(self._on_track_hovered)
+        self._rec_controller.message.connect(self.statusBar().showMessage)
+        self._rec_controller.state_changed.connect(self._on_rec_state)
+        self._rec_controller.saved.connect(self._on_rec_saved)
+        self._rec_controller.error.connect(self._on_rec_error)
 
-        for vid in ALL_VIEW_IDS:
-            self._open_btns[vid].clicked.connect(lambda _=False, v=vid: self._open_dialog(v))
         self.btn_add.clicked.connect(lambda: self._add_view())
         self.btn_remove.clicked.connect(self._remove_last_view)
         self.btn_first.clicked.connect(self._goto_first)
@@ -313,6 +391,7 @@ class MainWindow(QMainWindow):
         view.layout_drag_finished.connect(self._on_layout_drag_finished)
         view.view_dropped_on.connect(self._on_view_dropped_on)
         view.drop_zone_changed.connect(self._on_drop_zone_changed)
+        view.hover_changed.connect(self._on_view_hover_changed)
         view.context_menu_requested.connect(self._on_view_context_menu)
         view.btn_step_back.clicked.connect(lambda checked=False, v=view_id: self._step_view(v, -1))
         view.btn_step_fwd.clicked.connect(lambda checked=False, v=view_id: self._step_view(v, 1))
@@ -341,6 +420,56 @@ class MainWindow(QMainWindow):
             if view is not source:
                 view.surface.apply_paired_reset()
 
+    def _icon_button(self, icon: str, tooltip: str) -> QPushButton:
+        """Compact icon-only toolbar button (NoFocus, 16px glyph)."""
+        btn = QPushButton()
+        btn.setObjectName("iconButton")
+        btn.setIcon(make_icon(icon))
+        btn.setIconSize(QSize(16, 16))
+        btn.setToolTip(tooltip)
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        return btn
+
+    @staticmethod
+    def _separator() -> QFrame:
+        sep = QFrame()
+        sep.setObjectName("toolbarSeparator")
+        sep.setFixedSize(1, 18)
+        return sep
+
+    def _set_play_icon(self, playing: bool) -> None:
+        if self._play_icon_state == playing:
+            return
+        self._play_icon_state = playing
+        self.btn_play.setIcon(make_icon("pause" if playing else "play", "#ffffff"))
+        self.btn_play.setToolTip("Pause (Space)" if playing else "Play (Space)")
+        self.btn_play.setAccessibleName("Pause" if playing else "Play")
+
+    def _populate_layout_menu(self, menu: QMenu) -> None:
+        """(Re)build the layout menu; disabled while recording."""
+        menu.clear()
+        recording = self._recording()
+        reset = menu.addAction("Reset layout")
+        reset.triggered.connect(self._reset_layout)
+        reset.setEnabled(not recording)
+        presets = pane_layout.presets(self.view_ids)
+        if not presets:
+            return
+        menu.addSeparator()
+        for label, preset in presets:
+
+            def apply_preset(_checked: bool = False, p: pane_layout.Layout = preset) -> None:
+                self._set_layout(p)
+
+            action = menu.addAction(label, apply_preset)
+            action.setCheckable(True)
+            action.setChecked(preset == self._layout)
+            action.setEnabled(not recording)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        apply_dark_title_bar(self)
+
     def _add_shortcut(
         self, key: Qt.Key | QKeySequence | QKeySequence.StandardKey, handler: Callable[[], None]
     ) -> None:
@@ -358,8 +487,9 @@ class MainWindow(QMainWindow):
         self._drift_timer.stop()
         self._load_timer.stop()
         self._playing = False  # stop playback
-        if self._recorder is not None:
-            self._recorder.terminate()  # finalize the mp4 before we die
+        self._load_pending.clear()
+        self._reset_hover()
+        self._rec_controller.terminate()  # finalize the mp4 before we die
         self.config.window.width = self.width()
         self.config.window.height = self.height()
         self.config.save()
@@ -371,7 +501,7 @@ class MainWindow(QMainWindow):
     # -- dynamic views --------------------------------------------------------
 
     def _recording(self) -> bool:
-        return self._recorder is not None and self._recorder.recording
+        return self._rec_controller.recording
 
     def _add_view(self, load: Path | None = None) -> None:
         """Append a new view (up to MAX_VIEWS); optionally load a video."""
@@ -384,42 +514,44 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Maximum {MAX_VIEWS} views")
             return
         vid: ViewId = ALL_VIEW_IDS[len(self.view_ids)]
+        if vid in self.views:
+            logger.error("view id %s already registered; refusing to add", vid)
+            return
         view = VideoView(vid.upper())
         # Parent the widget before creating its player: ensure_player() hands
         # the pane's native window to mpv, and reparenting afterwards could
-        # recreate that handle. The view is registered up front and rolled
-        # back on failure — the rollback runs before any modal dialog so the
-        # nested event loop never sees the half-registered state.
+        # recreate that handle. Every registration step is inside the try so
+        # any failure rolls back to the exact pre-add state.
         prior_ids = list(self.view_ids)
         old_layout = [list(row) for row in self._layout]
-        self.views[vid] = view
-        self.view_host.add_view(view)
-        self._layout = pane_layout.add_view(
-            self._layout, vid, prior_ids, customized=self._layout_customized
-        )
-        # Minimum sizes must be updated before the grid re-activates: doing
-        # it afterwards leaves the top-level minimum stuck at the previous,
-        # possibly larger, layout until the next resize event.
-        self._apply_view_size_policy()
-        self.view_host.apply_layout(self._layout)
-        view.set_drag_enabled(not self._recording())
         try:
+            self._view_set.add(view)
+            self.view_host.add_view(view)
+            self._layout = pane_layout.add_view(
+                self._layout, vid, prior_ids, customized=self._layout_customized
+            )
+            # Minimum sizes must be updated before the grid re-activates:
+            # doing it afterwards leaves the top-level minimum stuck at the
+            # previous, possibly larger, layout until the next resize event.
+            self._apply_view_size_policy()
+            self.view_host.apply_layout(self._layout)
+            view.set_drag_enabled(not self._recording())
             view.ensure_player()
-            self.engines[vid] = SyncEngine(self.views["a"].player, view.player)
+            self.engines[vid] = SyncEngine(self.views[self._sync.master].player, view.player)
             self._wire_view(view, vid)
             self._connect_gestures(view)
             view.player.set_speed(self.config.speed)
             if self.btn_crosshair.isChecked():
                 view.player.set_crosshair(True)
-        except (RuntimeError, PlayerError, SystemError) as exc:
-            logger.warning("view %s failed to start: %s", vid, exc)
+        except Exception as exc:
+            logger.warning("view %s failed to start: %s", vid, exc, exc_info=True)
             self._destroy_view(vid)
             self._layout = old_layout
             self._apply_view_size_policy()
             self.view_host.apply_layout(self._layout)
+            self._refresh_view_buttons()
             QMessageBox.warning(self, "mpv error", str(exc))
             return
-        self.view_ids.append(vid)
         self._refresh_view_buttons()
         self.timeline.set_tracks(self.view_ids)
         self._timeline_durs = None  # force a refresh for the new track
@@ -446,10 +578,10 @@ class MainWindow(QMainWindow):
         self._apply_view_size_policy()
         self._destroy_view(vid)
         self.view_host.apply_layout(self._layout)
-        if self._active_view == vid:
-            self._active_view = "a"
         self._refresh_view_buttons()
+        self._set_active_view(self._active_view)
         self.timeline.set_tracks(self.view_ids)
+        self._reset_hover()
         self._timeline_durs = None  # force a refresh without the dropped view
         self._refresh_sync_ui()
         logger.info("view %s removed (%d views)", vid, len(self.view_ids))
@@ -467,14 +599,14 @@ class MainWindow(QMainWindow):
         widest = max((len(row) for row in self._layout), default=1)
         rows = max(1, len(self._layout))
         min_w = {1: 400, 2: 400, 3: 300, 4: 240}.get(widest, 240)
-        min_h = 260 if rows == 1 else 150
+        # Keep tall layouts from forcing the window off-screen.
+        min_h = 260 if rows == 1 else 150 if rows == 2 else 80
         for view in self.views.values():
             view.surface.setMinimumSize(min_w, min_h)
 
     def _destroy_view(self, vid: ViewId) -> None:
         """Remove a view from state and life (player released)."""
-        self.view_ids = [v for v in self.view_ids if v != vid]
-        view = self.views.pop(vid, None)
+        view = self._view_set.pop(vid)
         self.engines.pop(vid, None)
         self._load_pending.pop(vid, None)
         if view is not None:
@@ -485,6 +617,16 @@ class MainWindow(QMainWindow):
 
     # -- pane arrangement ------------------------------------------------------
 
+    def _reset_hover(self) -> None:
+        """Clear pane/timeline hover state (drag, recording, removal)."""
+        self.timeline.set_hovered_view(None)
+        self._track_hovered = None
+        for pane in self.views.values():
+            if pane.property("trackHover") != "":
+                pane.setProperty("trackHover", "")
+                pane.style().unpolish(pane)
+                pane.style().polish(pane)
+
     def _set_views_drag_enabled(self, enabled: bool) -> None:
         for view in self.views.values():
             view.set_drag_enabled(enabled)
@@ -492,6 +634,7 @@ class MainWindow(QMainWindow):
     def _on_layout_drag_started(self, source: str) -> None:
         # The drag runs its own nested event loop: shortcuts would still
         # fire (Space, arrows, R, ...) while the pointer is captured.
+        self._reset_hover()
         self._drag_source = source
         self._drag_changed = False
         for shortcut in self._shortcuts:
@@ -528,6 +671,35 @@ class MainWindow(QMainWindow):
             }.get(zone, "beside")
             message = f"Release to insert {source.upper()} {where} {target.upper()}"
         self.statusBar().showMessage(message)
+
+    def _on_view_hover_changed(self, view: str, hovered: bool) -> None:
+        """Pane hover drives the matching timeline track highlight."""
+        if self._drag_source is not None or self._closing or self._recording():
+            return
+        if view not in self.views:
+            return
+        if hovered:
+            self.timeline.set_hovered_view(cast(ViewId, view))
+        elif self.timeline.hovered_view_id == view:
+            self.timeline.set_hovered_view(None)
+
+    def _on_track_hovered(self, view: ViewId | None) -> None:
+        """Timeline hover highlights the matching pane."""
+        if self._drag_source is not None or self._closing or self._recording():
+            return
+        if view not in self.views:
+            view = None
+        if view == self._track_hovered:
+            return
+        previous = self._track_hovered
+        self._track_hovered = view
+        for vid in (previous, view):
+            pane = self.views.get(vid) if vid is not None else None
+            if pane is None:
+                continue
+            pane.setProperty("trackHover", "true" if vid == view else "")
+            pane.style().unpolish(pane)
+            pane.style().polish(pane)
 
     def _on_view_dropped_on(self, source: str, target: str, zone: str) -> None:
         if self._recording():
@@ -576,33 +748,23 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Stop recording before rearranging views")
             return
         default = pane_layout.default_layout(self.view_ids)
-        if not self._set_layout(default, customized=False):
-            self._layout_customized = False
+        if self._set_layout(default, customized=False):
             self.statusBar().showMessage("Layout reset")
+        else:
+            self._layout_customized = False
+            self.statusBar().showMessage("Layout already default")
 
     def _on_view_context_menu(self, _view_id: str, global_pos: QPoint) -> None:
         menu = QMenu(self)
-        reset = menu.addAction("Reset layout", self._reset_layout)
-        presets = pane_layout.presets(self.view_ids)
-        if presets:
-            menu.addSeparator()
-            for label, preset in presets:
-
-                def apply_preset(_checked: bool = False, p: pane_layout.Layout = preset) -> None:
-                    self._set_layout(p)
-
-                action = menu.addAction(label, apply_preset)
-                if self._recording():
-                    action.setEnabled(False)
-        if self._recording():
-            reset.setEnabled(False)
+        self._populate_layout_menu(menu)
         menu.exec(global_pos)
         menu.deleteLater()
 
     def _refresh_view_buttons(self) -> None:
-        """Show Open buttons for existing views; gate ＋/－ by the limits."""
-        for vid, btn in self._open_btns.items():
-            btn.setVisible(vid in self.views)
+        """Enable Open entries for existing views; gate ＋/－ by the limits."""
+        can_open = not self._recording()
+        for vid, action in self._open_actions.items():
+            action.setEnabled(vid in self.views and can_open)
         self.btn_add.setEnabled(len(self.view_ids) < MAX_VIEWS)
         self.btn_remove.setEnabled(len(self.view_ids) > MIN_VIEWS)
 
@@ -612,22 +774,26 @@ class MainWindow(QMainWindow):
         """Load a video into one of the views."""
         if view not in self.views:
             return
+        if self._recording():
+            self.statusBar().showMessage("Stop recording before opening videos")
+            return
         self._stop_playback()
-        # Sync offsets involving a reloaded view are meaningless for the
-        # new file (a reload of A breaks every pair, a follower only its own).
-        self._invalidate_sync(view)
         try:
             self.views[view].player.load(path)
         except PlayerError as exc:
             QMessageBox.warning(self, "open failed", str(exc))
             return
+        # Only a successfully accepted load invalidates the old file's sync:
+        # a failed dialog/file pick leaves the current session untouched.
+        # (A reload of A breaks every pair, a follower only its own.)
+        self._invalidate_sync(view)
         self._load_pending[view] = (path, 0)
         self.config.last_dir = str(path.parent)
         logger.info("view %s <- %s", view, path)
 
     def _on_load_tick(self) -> None:
-        """Poll pending loads; finalize range once both views are ready."""
-        if not self._initialized:
+        """Poll pending loads and push per-view durations."""
+        if not self._initialized or self._closing:
             return
         # Iterate a snapshot and delete finished entries BEFORE any modal
         # dialog runs: QMessageBox spins the event loop, so this slot can
@@ -668,13 +834,15 @@ class MainWindow(QMainWindow):
 
     def _on_view_loaded(self, view_id: ViewId, path: Path) -> None:
         """Loaded-view bookkeeping: join a running synced playback if able."""
-        if self._playing and view_id != "a":
+        if self._closing:
+            return
+        if self._playing and view_id != self._sync.master:
             eng = self.engines.get(view_id)
             if eng is not None and eng.ready and eng.state.is_complete:
-                a = self.views["a"].player
-                master = a.playback_time
+                master_player = self.views[self._sync.master].player
+                master = master_player.playback_time
                 if master is None:
-                    master = a.time_pos
+                    master = master_player.time_pos
                 if master is not None:
                     eng.seek_follower(master)
                     eng.reset_runtime()
@@ -694,7 +862,7 @@ class MainWindow(QMainWindow):
     # -- transport ------------------------------------------------------------------
 
     def _any_engine_ready(self) -> bool:
-        return any(eng.ready for eng in self.engines.values())
+        return self._sync.any_ready
 
     def _require_ready(self) -> bool:
         if not self._any_engine_ready():
@@ -704,40 +872,15 @@ class MainWindow(QMainWindow):
 
     def _master_range(self) -> tuple[float, float] | None:
         """Master interval where every ready pair has frames."""
-        return intersect_master_ranges(self.engines.values())
+        return self._sync.master_range()
 
     def _reference_fps(self) -> float:
-        for eng in self.engines.values():
-            if eng.ready:
-                return eng.reference_fps
-        fps = self.views["a"].player.fps
-        return fps if fps and fps > 0 else 25.0
+        return self._sync.reference_fps()
 
     def _seek_master_all(self, master: float, *, exact: bool = True) -> None:
-        """Seek A once and every ready follower to one master position.
-
-        The target is clamped to the *intersection* of all ready ranges
-        before any player moves: clamping per engine would let the last
-        engine drag A away from the followers already seeked (the
-        intersection is always inside A's own range, so seeking A directly
-        with the clamped value is safe).
-        """
-        rng = self._master_range()
-        if rng is None:
-            if self._any_engine_ready():
-                self.statusBar().showMessage("No common range between loaded views")
-            return
-        master = min(max(master, rng[0]), rng[1])
-        a = self.views["a"].player
-        if exact:
-            a.seek_exact(master)
-        else:
-            a.seek_fast(master)
-        for eng in self.engines.values():
-            if eng.ready:
-                eng.seek_follower(master, exact=exact)
-                # A hard seek invalidates the EWMA the loop was built on.
-                eng.reset_runtime()
+        """Seek the master once and every ready follower to one position."""
+        if not self._sync.seek_master_all(master, exact=exact) and self._any_engine_ready():
+            self.statusBar().showMessage("No common range between loaded views")
 
     @staticmethod
     def _at_stream_end(player: PlayerController) -> bool:
@@ -758,7 +901,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(200, self._resync_if_needed)
             return
         rng = self._master_range()
-        master = self.views["a"].player.time_pos
+        master = self.views[self._sync.master].player.time_pos
         if rng is not None and master is not None and master >= rng[1] - 1e-6:
             self._seek_master_all(rng[0])  # all views at EOF: restart together
         # When synced, snap followers onto A's aligned position before
@@ -808,7 +951,7 @@ class MainWindow(QMainWindow):
         if not self._require_ready():
             return
         self._stop_playback()
-        master = self.views["a"].player.time_pos
+        master = self.views[self._sync.master].player.time_pos
         if master is None:
             return
         master += frames / self._reference_fps()
@@ -886,41 +1029,35 @@ class MainWindow(QMainWindow):
     # -- sync ------------------------------------------------------------------
 
     def _set_active_view(self, view: str) -> None:
-        vid = view.lower()
-        if vid in self.views:
-            self._active_view = vid  # type: ignore[assignment]
+        vid = cast(ViewId, view.lower())
+        if vid not in self.views:
+            return
+        self._active_view = vid
+        for pane_id, pane in self.views.items():
+            wanted = "true" if pane_id == vid else ""
+            if pane.property("activePane") == wanted:
+                continue
+            pane.setProperty("activePane", wanted)
+            pane.style().unpolish(pane)
+            pane.style().polish(pane)
 
     def _current_anchors(self) -> dict[ViewId, float | None]:
-        """Anchor per view, rebuilt from the engines' sync states.
-
-        The A-side anchor is taken from the first complete pair (they are
-        normally identical; a deterministic pick beats last-wins).
-        """
-        anchors: dict[ViewId, float | None] = {vid: None for vid in self.view_ids}
-        for vid, eng in self.engines.items():
-            if eng.state.is_complete:
-                if anchors["a"] is None:
-                    anchors["a"] = eng.state.point_a
-                anchors[vid] = eng.state.point_b
-        return anchors
+        return self._sync.current_anchors()
 
     def _current_offsets(self) -> dict[ViewId, float]:
-        """Offsets of every synced follower pair (empty when unsynced)."""
-        return {vid: eng.offset for vid, eng in self.engines.items() if eng.state.is_complete}
+        return self._sync.current_offsets()
 
     def _invalidate_sync(self, view: ViewId) -> None:
         """Drop sync anchors that involve a (re)loaded view."""
-        affected = list(self.engines) if view == "a" else [view]
+        affected = list(self.engines) if view == self._sync.master else [view]
+        cleared = self._sync.invalidate(view)
         for vid in affected:
-            eng = self.engines.get(vid)
-            if eng is not None and eng.state.is_complete:
-                eng.clear_sync()
             follower = self.views.get(vid)
             if follower is not None:
                 # A regulate() nudge may have left the follower at ±10%;
                 # without an anchor the loop no longer corrects it.
                 follower.player.set_speed(self.config.speed)
-        if any(vid in self.engines for vid in affected):
+        if cleared:
             self._refresh_sync_ui()
 
     def _refresh_sync_ui(self) -> None:
@@ -935,21 +1072,13 @@ class MainWindow(QMainWindow):
         if not self._require_ready():
             return
         self._stop_playback()
-        offsets: dict[ViewId, float] = {}
-        error: str | None = None
-        for vid, eng in self.engines.items():
-            if not eng.ready:
-                continue
-            try:
-                offsets[vid] = eng.sync_here()
-            except SyncError as exc:
-                error = str(exc)
+        offsets, error = self._sync.align_current()
         if not offsets:
             logger.warning("align failed: %s", error)
             self.statusBar().showMessage(f"Cannot sync: {error or 'no pair ready'}")
             return
         rng = self._master_range()
-        master = self.views["a"].player.time_pos
+        master = self.views[self._sync.master].player.time_pos
         if rng is not None and master is not None:
             self._seek_master_all(min(max(master, rng[0]), rng[1]))
         self._refresh_sync_ui()
@@ -977,12 +1106,12 @@ class MainWindow(QMainWindow):
         if not self._initialized:
             return
         self._stop_playback()
-        for eng in self.engines.values():
-            eng.clear_sync()
+        self._sync.clear_sync()
         # Undo any ±10% regulate nudge: without an anchor the loop stops
         # correcting, so a nudged follower would otherwise keep that speed.
-        for vid in self.view_ids[1:]:
-            self.views[vid].player.set_speed(self.config.speed)
+        for vid in self.view_ids:
+            if vid != self._sync.master:
+                self.views[vid].player.set_speed(self.config.speed)
         self._refresh_sync_ui()
         self.statusBar().showMessage("Sync cleared")
 
@@ -990,87 +1119,25 @@ class MainWindow(QMainWindow):
 
     def _toggle_record(self) -> None:
         """F9 / Rec button: start recording, or stop when one is running."""
-        if self._recorder is not None and self._recorder.recording:
-            self._stop_recording()
-        else:
-            self._start_recording()
-
-    def _start_recording(self) -> None:
-        """Probe ffmpeg and launch a capture of the views' screen region."""
-        ffmpeg = rec.locate_ffmpeg()
-        if ffmpeg is None:
-            self.statusBar().showMessage("Recording unavailable: ffmpeg not found")
-            return
-        support = rec.probe_capabilities(ffmpeg)
-        if support is None:
-            self.statusBar().showMessage("Recording unavailable: no capture pipeline")
-            return
-        if self.isMinimized():
-            self.statusBar().showMessage("Restore the window before recording")
-            return
-        region = rec.physical_region(self.view_host)
-        screens = rec.screen_physical_rects()
-        # Clip invisible slivers a maximized window hangs past the screen.
-        region = rec.clamp_region_to_desktop(region, screens)
-        primary = QGuiApplication.primaryScreen()
-        pg = primary.geometry()
-        pdpr = primary.devicePixelRatio()
-        prect = (pg.x(), pg.y(), round(pg.width() * pdpr), round(pg.height() * pdpr))
-        # ddagrab addresses the primary display only (DDA output 0):
-        # the region must sit fully inside the primary screen's physical
-        # rect; off-primary needs the gdigrab pipeline, if this ffmpeg
-        # build has one at all.
-        profile = support.primary
-        if profile.capture == "ddagrab" and not rec.region_within(region, prect):
-            if support.off_primary is None:
-                self.statusBar().showMessage("Move the window to the primary screen to record")
-                return
-            profile = support.off_primary
-        # Reject regions with corners off the virtual desktop (window
-        # half off-screen, parked at -32000, ...): ffmpeg cannot capture.
-        if not rec.region_fully_on_screens(region, screens):
-            self.statusBar().showMessage(
-                "Recording region is off-screen; move the window fully onto a screen"
-            )
-            return
-        out = rec.unique_output_path(rec.default_output_dir(), rec.output_timestamp())
-        try:
-            recorder = self._recorder
-            if recorder is None:
-                recorder = rec.ScreenRecorder(ffmpeg, profile, self)
-                recorder.stateChanged.connect(self._on_rec_state)
-                recorder.error.connect(self._on_rec_error)
-                recorder.saved.connect(self._on_rec_saved)
-                # Assign before start(): the "recording" state signal
-                # fires synchronously inside start() and its slot reads
-                # self._recorder for the output path.
-                self._recorder = recorder
-            recorder.start(region, out, profile)
-        except (rec.RecorderError, OSError, RuntimeError) as exc:
-            QMessageBox.warning(self, "record failed", str(exc))
-            return
-        self._rec_secs = -1
-        logger.info("recording region %s -> %s", region.as_ffmpeg_geom(), out)
-
-    def _stop_recording(self) -> None:
-        """Graceful stop; the recorder's own watchdog force-kills hangs."""
-        recorder = self._recorder
-        if recorder is not None:
-            recorder.stop()
+        self._rec_controller.toggle()
 
     def _on_rec_state(self, state: str) -> None:
         if state == "recording":
             self.btn_rec.setText("⏺ 0:00")
             self._set_rec_button_active(True)
             self._set_views_drag_enabled(False)
-            if self._recorder is not None and self._recorder.output is not None:
-                self.statusBar().showMessage(f"Recording → {self._recorder.output.name}")
+            self._reset_hover()
+            self._refresh_view_buttons()
+            output_name = self._rec_controller.output_name
+            if output_name is not None:
+                self.statusBar().showMessage(f"Recording → {output_name}")
         elif state == "stopping":
             self.btn_rec.setText("⏹ finishing…")
         else:  # finished / failed
             self.btn_rec.setText("⏺ Rec")
             self._set_rec_button_active(False)
             self._set_views_drag_enabled(True)
+            self._refresh_view_buttons()
 
     def _set_rec_button_active(self, active: bool) -> None:
         self.btn_rec.setProperty("rec", "on" if active else "off")
@@ -1131,110 +1198,73 @@ class MainWindow(QMainWindow):
     # -- timers ------------------------------------------------------------------
 
     def _on_ui_tick(self) -> None:
-        if not self._initialized:
+        if not self._initialized or self._closing:
             return
         # Recording elapsed time on the Rec button (once per second) runs
         # before the engine guard: recording works without loaded videos.
         # Only while truly RECORDING: in STOPPING the "finishing…" label
         # must not be overwritten by the timer.
-        if self._recorder is not None and self._recorder.state is rec.RecorderState.RECORDING:
-            secs = int(self._recorder.elapsed_seconds())
+        if self._rec_controller.state is rec.RecorderState.RECORDING:
+            secs = int(self._rec_controller.elapsed_seconds())
             if secs != self._rec_secs:
                 self._rec_secs = secs
                 self.btn_rec.setText(f"⏺ {secs // 60}:{secs % 60:02d}")
-        a = self.views["a"].player
-        master = a.time_pos
-        if master is None:
-            return  # view A not loaded yet
-        # Follow each player's real state, not the global sync flag: a
-        # solo-playing view must animate its own track.
-        if a.is_playing:
-            # playback-time is clock-interpolated: smoother than time_pos.
-            pt = a.playback_time
-            if pt is not None:
-                master = pt
-        shown = self._smooth_playhead(master, a.is_playing)
+        master_player = self.views[self._sync.master].player
+        master = master_player.time_pos
+        shown: float | None = None
+        if master is not None:
+            # Follow each player's real state, not the global sync flag: a
+            # solo-playing view must animate its own track.
+            if master_player.is_playing:
+                # playback-time is clock-interpolated: smoother than time_pos.
+                pt = master_player.playback_time
+                if pt is not None:
+                    master = pt
+            shown = self._playhead.update(
+                master,
+                master_player.is_playing,
+                self.config.speed,
+                master_player.duration,
+            )
         # Each knob shows its own video's actual local time (so solo
         # playback moves only that track); the mapped position is a
         # fallback while a follower is mid-load and reports no time yet.
-        heads: dict[ViewId, float] = {"a": shown}
-        for vid in self.view_ids[1:]:
+        # Follower readouts keep updating even when A is empty.
+        heads: dict[ViewId, float] = {} if shown is None else {self._sync.master: shown}
+        for vid in self.view_ids:
+            if vid == self._sync.master:
+                continue
             p = self.views[vid].player
             t = p.playback_time
             if t is None:
                 t = p.time_pos
-            if t is None:
+            if t is None and shown is not None:
                 eng = self.engines.get(vid)
                 t = eng.view_time(vid, shown) if eng is not None else shown
+            if t is None:
+                continue
             dur = p.duration
             if dur is not None:
                 t = min(t, dur)
             heads[vid] = t
-        self.timeline.set_playheads(heads)
+        if heads:
+            self.timeline.set_playheads(heads)
         for vid in self.view_ids:
             self._update_view_time(self.views[vid])
             self.views[vid].set_play_text(self.views[vid].player.is_playing)
-        self._status_live.setText(self._live_status_text(master))
-        self.btn_play.setText("Pause" if self._playing else "Play")
-
-    def _live_status_text(self, master: float) -> str:
-        """Status-bar readout: exact per-pair detail until it stops fitting."""
-        fps = self._reference_fps()
-        offsets = self._current_offsets()
-        drifts = {vid: eng.drift() for vid, eng in self.engines.items() if eng.ready}
-        parts = [
-            f"A{vid.upper()} {off:+.3f}s ({self._drift_ms(drifts.get(vid))})"
-            for vid, off in offsets.items()
-        ]
-        if len(offsets) <= 1:
-            self._status_live.setToolTip("")
-            off = next(iter(offsets.values()), 0.0)
-            # Prefer the drift of the synced pair itself; fall back to any
-            # ready engine when nothing is synced (keeps the old readout).
-            synced_vid = next(iter(offsets), None)
-            drift = drifts.get(synced_vid) if synced_vid is not None else None
-            if synced_vid is None:
-                drift = next(iter(drifts.values()), None)
-            return (
-                f"A {master:8.3f}s | offset {off:+.3f}s "
-                f"| drift {self._drift_ms(drift)} | {fps:g}fps"
+        if shown is not None:
+            assert master is not None
+            readout = format_live_status(
+                master,
+                self._current_offsets(),
+                {vid: eng.drift() for vid, eng in self.engines.items() if eng.ready},
+                self._reference_fps(),
             )
-        if len(offsets) == 2:
-            self._status_live.setToolTip("")
-            return f"A {master:8.3f}s | {' | '.join(parts)} | {fps:g}fps"
-        # 3 synced pairs: one line, per-pair detail in the tooltip. The
-        # worst-case figure only considers synced pairs.
-        self._status_live.setToolTip(" | ".join(parts))
-        worst = max(
-            (abs(d) for vid, d in drifts.items() if vid in offsets and d is not None),
-            default=0.0,
-        )
-        return (
-            f"A {master:8.3f}s | {len(offsets)} synced pairs "
-            f"| max drift {worst * 1000:+.1f}ms | {fps:g}fps"
-        )
-
-    @staticmethod
-    def _drift_ms(drift: float | None) -> str:
-        return f"{drift * 1000:+.1f}ms" if drift is not None else "n/a"
-
-    def _smooth_playhead(self, raw: float, playing: bool) -> float:
-        """Interpolate between mpv frame updates so the playhead glides."""
-        now = time.monotonic()
-        if not playing or raw != self._playhead_raw:
-            self._playhead_raw = raw
-            self._playhead_anchor = raw
-            self._playhead_mono = now
-            return raw
-        est = self._playhead_anchor + (now - self._playhead_mono) * self.config.speed
-        # Clamp to A's own extent: the A track spans the full video, so a
-        # solo-playing A past the sync overlap must keep moving its knob
-        # (clamping to master_range would freeze it mid-track while the
-        # status bar keeps counting).
-        dur_a = self.views["a"].player.duration
-        if dur_a is not None:
-            est = min(max(est, 0.0), dur_a)
-        return est
+            self._status_live.setText(readout.text)
+            self._status_live.setToolTip(readout.tooltip)
+        else:
+            self._status_live.setText("A not loaded")
+        self._set_play_icon(self._playing)
 
     @staticmethod
     def _update_view_time(view: VideoView) -> None:
@@ -1248,7 +1278,7 @@ class MainWindow(QMainWindow):
         +/-10%); a hard seek fires only beyond a few frames.
         Community-validated approach (Syncplay / mpv issue #13905).
         """
-        if not self._initialized:
+        if not self._initialized or self._closing:
             return
         # Heartbeat before guards: proves the timer fires even when the
         # regulation path is skipped (unloaded / paused / not synced).
@@ -1264,9 +1294,4 @@ class MainWindow(QMainWindow):
             )
         if not self._playing:
             return
-        for eng in self.engines.values():
-            # An offset of 0 is not a sync: without an anchor, nudging a
-            # follower's speed would drag an intentionally offset view
-            # back onto A.
-            if eng.ready and eng.state.is_complete:
-                eng.regulate(self.config.speed)
+        self._sync.regulate(self.config.speed)

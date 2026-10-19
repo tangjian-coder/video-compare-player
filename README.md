@@ -10,6 +10,7 @@
 - 缩放/平移/旋转：默认操作**所有视图联动**（滚轮缩放各走一档、拖拽像素级 1:1 平移、双击复位），**Ctrl+操作仅作用于本侧**；每侧 `↻` 按钮顺时针旋转 90°
 - **一键录屏**：`F9` 把所有视频区（含标题栏与各侧控制条，不含时间轴/走带栏/状态栏）录成 mp4，对齐后同步播放的演示素材直接可发（自动选档：NVENC 硬编 60fps → 桌面复制+x264 → gdigrab+x264）
 - **十字准星**：`C` 在每个视图**窗格中心**显示一条 **1px 红色十字线**（mpv OSD 渲染），缩放/平移/旋转时**纹丝不动**——这是对比运动幅度的稳定参照物，会被录进录屏
+- **macOS 深色视觉**：内置 Inter 字体、矢量图标、分组传输栏、卡片式时间轴与深色原生标题栏；拖拽窗格有独立拖影与插入线，窗格与时间轴悬停联动高亮
 - 拖放加载，支持命令行直接传 2–4 个视频
 
 ## 运行
@@ -37,11 +38,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 
 2–4 个独立视频块（Kinovea 双屏风格）：每块含标题栏（A/B/C/D 徽章 + 文件名，蓝/绿/靛蓝/橙）、视频区、底部控制条（本侧逐帧 `<` `>` + 时间读数）。下方是共享传输栏（文件与视图 ＋－ / 走带 / 速度与同步）和状态栏（A 时间 / 各对 offset / 实时漂移 / 帧率）。**`V` 键或 `＋` 追加视图，`－` 移除最后一个（A、B 常驻）**。
 
-**同步校准**：用各块底部的 `<` `>` 把每个视图各自走到同一物理瞬间（如秒表刚跳到 `05.00` 的帧）→ 点 `⇄ Align current frames` 或按 `S` → 完成。按 `R` 清除全部。详见操作手册。
+**同步校准**：用各块底部的 `<` `>` 把每个视图各自走到同一物理瞬间（如秒表刚跳到 `05.00` 的帧）→ 点 `Align` 或按 `S` → 完成。按 `R` 清除全部。详见操作手册。
 
 ## 快捷键
 
-`Space` 同步播放/暂停 · `←`/`→` 全视图逐帧 · `↑`/`↓` 变速 · `Home`/`End` 跳对齐区间首尾 · `S` 一键对齐 · `R` 清除同步 · `F9` 录屏开始/停止 · `C` 十字准星 · `V` 追加视图 · `Ctrl+O` 打开视频
+`Space` 同步播放/暂停 · `←`/`→` 全视图逐帧 · `↑`/`↓` 变速 · `Home`/`End` 跳对齐区间首尾 · `S` 一键对齐 · `R` 清除同步 · `F9` 录屏开始/停止 · `C` 十字准星 · `V` 追加视图 · `Ctrl+O` 打开视频（蓝色边框的活动窗格）
 
 完整快捷键、时间轴与状态栏的详细说明见 **`docs\controls-guide.md`（操作手册）**。
 
@@ -55,7 +56,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 | 左键拖拽 | 平移：像素级 1:1 跟随鼠标，各自边缘钳制 | 本侧平移 |
 | 双击 | 复位缩放、平移和旋转 | 本侧复位 |
 
-每块底部 Play 旁的 `↻` 按钮＝本侧顺时针旋转 90°（循环 0→90→180→270，旋转时平移回中、缩放保留），当前角度直接显示在按钮上（如 `↻ 90°`）；缩放倍率 `×2.4` 显示在时间读数旁。
+每块底部 Play 旁的 `↻` 按钮＝本侧顺时针旋转 90°（循环 0→90→180→270，旋转时平移回中、缩放保留），当前角度显示在按钮右侧的等宽读数里（0° 时隐藏但保留位置）；缩放倍率 `×2.4` 显示在时间读数旁。
 
 ## 开发
 
@@ -70,15 +71,17 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 
 ```
 src\vcplayer\
-├── core\    models.py（数据模型）player.py（libmpv 封装）sync.py（同步引擎，纯逻辑，每跟随视图一个实例）
-├── ui\      video_view.py（渲染表面+缩放平移）timeline.py（多轨时间轴）main_window.py
+├── core\    models.py / player.py（libmpv 封装）/ sync.py（同步引擎）/ recorder.py（录屏）
+├── ui\      main_window.py（编排）/ video_view.py（窗格+原生表面）/ view_host.py（网格布局）/ view_set.py（视图注册表）/ recording_controller.py（录屏会话）/ sync_session.py（同步会话）/ status_presenter.py（状态格式化）
+│            layout.py（纯布局模型）/ timeline.py（多轨时间轴）/ style.py + theme.py（主题）
+│            icons.py（矢量图标）/ widgets.py / pane_drag.py（拖放编解码）/ win_chrome.py
 ├── app.py / __main__.py / config.py
-tests\       core 逻辑单测（FakePlayer stub，无 GUI 依赖）
+tests\       core 纯逻辑 + 布局/时间轴数学 + offscreen UI 测试（FakePlayer，无真实 mpv）
 vendor\      libmpv-2.dll（mpv v0.41，硬解 + HDR）
-docs\        设计文档
+docs\        操作手册；2026-08-21 设计文档为 v1 历史背景
 ```
 
-设计决策见 `docs\2026-08-21-video-compare-player-design.md`。
+设计决策见 `docs\2026-08-21-video-compare-player-design.md`（v1 历史；当前行为以 README 与操作手册为准）。
 
 ## 环境要求
 

@@ -3,6 +3,8 @@
 日期：2026-08-21
 状态：已批准（用户 "go"）
 
+> **历史设计（v1 双视图）**：产品后续已扩展到 2–4 视图、动态布局、录屏、主题与拖拽排列。当前行为以 README / `docs/controls-guide.md` 与代码为准；本文件仅保留 v1 的决策背景。
+
 ## 背景
 
 Kinovea 内置 FFmpeg 为 2015 年版（avcodec-56），软解高帧率/HDR/高码率素材时严重卡顿，且无法通过替换 DLL 升级（ABI 不兼容，P/Invoke 绑定 avcodec-56）。本项目用 **libmpv v0.41**（NVDEC 硬解 + HDR tone-mapping + 精确 seek）实现一个双屏同步对比播放器，直接播放原始文件，无需预转码。

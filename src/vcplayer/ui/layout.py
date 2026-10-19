@@ -25,7 +25,6 @@ ZONE_RIGHT = "right"
 ZONE_TOP = "top"
 ZONE_BOTTOM = "bottom"
 ZONE_CENTER = "center"
-ZONES: tuple[str, ...] = (ZONE_LEFT, ZONE_RIGHT, ZONE_TOP, ZONE_BOTTOM, ZONE_CENTER)
 
 
 def default_layout(view_ids: Sequence[str]) -> Layout:
@@ -58,7 +57,6 @@ def presets(view_ids: Sequence[str]) -> list[tuple[str, Layout]]:
             ("Grid (2x2)", [ids[:2], ids[2:]]),
             ("Row (1x4)", [ids]),
             ("Top 3 + 1", [ids[:3], ids[3:]]),
-            ("Stacked (4 rows)", [[vid] for vid in ids]),
         ]
     return []
 

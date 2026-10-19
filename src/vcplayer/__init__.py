@@ -1,3 +1,3 @@
-"""video-compare-player: dual-video synchronized comparison player."""
+"""video-compare-player: 2-4 pane synchronized comparison player."""
 
 __version__ = "0.1.0"

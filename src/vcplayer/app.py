@@ -39,6 +39,18 @@ def _apply_window_icon(app: QApplication) -> None:
         logger.warning("no app icon files found under %s", ASSETS_DIR)
 
 
+def _load_bundled_fonts() -> None:
+    """Register bundled fonts (Inter, OFL) with Qt before styling."""
+    from PySide6.QtGui import QFontDatabase
+
+    path = ASSETS_DIR / "fonts" / "Inter-Variable.ttf"
+    if path.is_file():
+        if QFontDatabase.addApplicationFont(str(path)) == -1:
+            logger.warning("failed to register bundled font: %s", path)
+    else:
+        logger.warning("bundled font missing: %s", path)
+
+
 def _prepare_libmpv_path() -> None:
     """Make vendor/libmpv-2.dll discoverable before mpv is imported."""
     if VENDOR_DIR.is_dir():
@@ -92,6 +104,7 @@ def run(videos: Sequence[Path] | None = None) -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("video-compare-player")
+    _load_bundled_fonts()
     _apply_window_icon(app)
     apply_app_style(app)
 

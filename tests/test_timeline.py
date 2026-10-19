@@ -2,7 +2,14 @@
 
 import pytest
 
-from vcplayer.ui.timeline import TimelineWidget, track_x_to_master, tracks_height
+from vcplayer.ui.timeline import (
+    TRACK_H,
+    TRACK_PITCH,
+    TRACK_TOP_Y,
+    TimelineWidget,
+    track_x_to_master,
+    tracks_height,
+)
 
 # -- track_x_to_master --------------------------------------------------------
 
@@ -138,8 +145,19 @@ def test_scrub_map_uses_per_view_offset(widget: TimelineWidget) -> None:
     widget.set_tracks(["a", "b", "c"])
     widget.set_durations({"a": 40.0, "b": 40.0, "c": 40.0})
     widget.set_offsets({"b": 1.0, "c": -0.5})
-    # Fixture width() = 100: same pixel maps A directly, B/C shift by
-    # their own offsets.
-    assert widget._x_to_master(50.0, "a") == pytest.approx(20.0)
-    assert widget._x_to_master(50.0, "b") == pytest.approx(19.0)
-    assert widget._x_to_master(50.0, "c") == pytest.approx(20.5)
+    # Fixture width() = 100, with a 26px badge gutter and 12px right pad:
+    # x=50 maps through 24/62 of the 40s span (same pixel for all views,
+    # each shifted by its own offset).
+    assert widget._x_to_master(50.0, "a") == pytest.approx(24.0 / 62.0 * 40.0)
+    assert widget._x_to_master(50.0, "b") == pytest.approx(24.0 / 62.0 * 40.0 - 1.0)
+    assert widget._x_to_master(50.0, "c") == pytest.approx(24.0 / 62.0 * 40.0 + 0.5)
+
+
+def test_hover_at_only_hits_track_rows(widget: TimelineWidget) -> None:
+    widget.set_tracks(["a", "b"])
+    first = TRACK_TOP_Y + TRACK_H / 2
+    second = first + TRACK_PITCH
+    assert widget._hover_at(first) == "a"
+    assert widget._hover_at(second) == "b"
+    assert widget._hover_at(1.0) is None
+    assert widget._hover_at(1000.0) is None

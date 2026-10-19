@@ -1,4 +1,4 @@
-"""Screen recording of the two video views via an ffmpeg subprocess.
+"""Screen recording of the comparison panes via an ffmpeg subprocess.
 
 Records the on-screen region covered by the side-by-side video area
 (no timeline / transport / status bar) so aligned A/B playback can be
@@ -491,6 +491,21 @@ def build_args(profile: EncoderProfile, region: Region, out: Path) -> list[str]:
     ]
 
 
+def repair_command(ffmpeg: Path, path: Path, fixed: Path) -> list[str]:
+    """ffmpeg remux command that salvages a force-killed mp4 tail."""
+    return [
+        str(ffmpeg),
+        "-y",
+        "-err_detect",
+        "ignore_err",
+        "-i",
+        str(path),
+        "-c",
+        "copy",
+        str(fixed),
+    ]
+
+
 def repair_mp4(ffmpeg: Path, path: Path) -> bool:
     """Remux a file whose tail was damaged by a force-kill.
 
@@ -501,17 +516,7 @@ def repair_mp4(ffmpeg: Path, path: Path) -> bool:
         return False
     fixed = path.with_suffix(".fixed.mp4")
     res = subprocess.run(
-        [
-            str(ffmpeg),
-            "-y",
-            "-err_detect",
-            "ignore_err",
-            "-i",
-            str(path),
-            "-c",
-            "copy",
-            str(fixed),
-        ],
+        repair_command(ffmpeg, path, fixed),
         capture_output=True,
         timeout=60,
         check=False,
@@ -552,6 +557,14 @@ class ScreenRecorder(QObject):
         self._t0 = 0.0
         self._stop_deadline: float | None = None
         self._crashed = False
+        self._repair_proc: QProcess | None = None
+        self._repair_out: Path | None = None
+        self._repair_fixed: Path | None = None
+        self._repair_graceful = False
+        self._repair_done = False
+        self._repair_timeout = QTimer(self)
+        self._repair_timeout.setSingleShot(True)
+        self._repair_timeout.timeout.connect(self._on_repair_timeout)
         self._watchdog = QTimer(self)
         self._watchdog.setSingleShot(True)
         self._watchdog.timeout.connect(self.force_stop_watchdog)
@@ -655,6 +668,12 @@ class ScreenRecorder(QObject):
             if proc.state() is not QProcess.ProcessState.NotRunning:
                 proc.kill()
                 proc.waitForFinished(2000)
+        repair = self._repair_proc
+        if repair is not None:
+            self._repair_done = True
+            self._repair_timeout.stop()
+            repair.kill()
+            repair.waitForFinished(1000)
 
     # -- process events ------------------------------------------------------
 
@@ -698,28 +717,103 @@ class ScreenRecorder(QObject):
                 self._set_state(RecorderState.FAILED)
                 self.error.emit("ffmpeg exited without writing output")
             return
-        # Non-zero exit: try to salvage what was captured.
-        salvaged = (
-            out is not None
-            and out.is_file()
-            and out.stat().st_size > 4096
-            and repair_mp4(self._ffmpeg, out)
+        # Non-zero exit: salvage asynchronously so a 60 s remux never
+        # freezes the UI thread. The state stays STOPPING until it finishes.
+        if out is not None and out.is_file() and out.stat().st_size > 4096:
+            self._start_repair(out, graceful)
+        else:
+            self._fail_recording(out, graceful)
+
+    def _start_repair(self, out: Path, graceful: bool) -> None:
+        """Remux a damaged tail in a QProcess; finish via signals."""
+        fixed = out.with_suffix(".fixed.mp4")
+        with contextlib.suppress(OSError):
+            fixed.unlink()
+        self._repair_out = out
+        self._repair_fixed = fixed
+        self._repair_graceful = graceful
+        self._repair_done = False
+        proc = QProcess(self)
+        proc.setProgram(str(self._ffmpeg))
+        proc.setArguments(repair_command(self._ffmpeg, out, fixed)[1:])
+        proc.setProcessEnvironment(QProcessEnvironment.systemEnvironment())
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        proc.finished.connect(self._on_repair_finished)
+        proc.errorOccurred.connect(self._on_repair_error)
+        self._repair_proc = proc
+        proc.start()
+        self._repair_timeout.start(60_000)
+
+    def _on_repair_error(self, err: QProcess.ProcessError) -> None:
+        # finished() covers crashes; only a failed launch has no finish.
+        if err is QProcess.ProcessError.FailedToStart and not self._repair_done:
+            logger.warning("repair process failed to start")
+            self._finish_repair(False)
+
+    def _on_repair_timeout(self) -> None:
+        repair = self._repair_proc
+        if repair is not None:
+            repair.kill()
+            self._finish_repair(False)
+
+    def _on_repair_finished(self, code: int, _status: QProcess.ExitStatus) -> None:
+        if self._repair_done:
+            return
+        self._repair_done = True
+        self._repair_timeout.stop()
+        proc = self._repair_proc
+        self._repair_proc = None
+        if proc is not None:
+            proc.deleteLater()
+        fixed = self._repair_fixed
+        out = self._repair_out
+        logger.info(
+            "repair finished: code=%s fixed=%s size=%s",
+            code,
+            fixed,
+            fixed.stat().st_size if fixed is not None and fixed.is_file() else None,
         )
+        salvaged = code == 0 and fixed is not None and fixed.is_file() and fixed.stat().st_size > 0
+        if salvaged and fixed is not None and out is not None:
+            try:
+                fixed.replace(out)
+            except OSError:
+                logger.warning("could not replace damaged clip with repaired copy")
+                salvaged = False
+        if not salvaged and fixed is not None:
+            with contextlib.suppress(OSError):
+                fixed.unlink()
+        self._finish_repair(salvaged)
+
+    def _finish_repair(self, salvaged: bool) -> None:
+        out = self._repair_out
+        graceful = self._repair_graceful
+        proc = self._repair_proc
+        self._repair_proc = None
+        if proc is not None:
+            proc.deleteLater()
+        self._repair_out = None
+        self._repair_fixed = None
+        self._repair_done = True
         if salvaged:
             self._set_state(RecorderState.FINISHED)
-            self.saved.emit(str(out))
+            if out is not None:
+                self.saved.emit(str(out))
         else:
-            with contextlib.suppress(OSError):
-                if out is not None:
-                    out.unlink()
-            self._set_state(RecorderState.FAILED)
-            if self._crashed:
-                reason = "ffmpeg crashed"
-            elif graceful:
-                reason = "finalization failed"
-            else:
-                reason = "ffmpeg failed"
-            self.error.emit(reason)
+            self._fail_recording(out, graceful)
+
+    def _fail_recording(self, out: Path | None, graceful: bool) -> None:
+        with contextlib.suppress(OSError):
+            if out is not None:
+                out.unlink()
+        self._set_state(RecorderState.FAILED)
+        if self._crashed:
+            reason = "ffmpeg crashed"
+        elif graceful:
+            reason = "finalization failed"
+        else:
+            reason = "ffmpeg failed"
+        self.error.emit(reason)
 
     def force_stop_watchdog(self) -> None:
         """Watchdog tick: force-kill when the graceful stop is stuck."""

@@ -1,8 +1,9 @@
 """Stable grid container for the comparison panes.
 
-Views are never reparented here: MpvSurface renders into a native child
-window and a reparent would recreate the HWND (black video). The host only
-moves widgets within its own QGridLayout, which is a pure geometry change.
+Views are never reparented during layout changes: MpvSurface renders into a
+native child window and a reparent would recreate the HWND (black video).
+The host only moves widgets within its own QGridLayout (teardown is the only
+path that detaches a terminated pane).
 """
 
 from __future__ import annotations
@@ -29,7 +30,9 @@ from .layout import (
     Layout,
     cells,
 )
-from .video_view import VIEW_MIME, VideoView
+from .pane_drag import decode_view_id
+from .theme import ACCENT_BLUE
+from .video_view import VideoView
 
 
 class ViewHost(QWidget):
@@ -39,8 +42,8 @@ class ViewHost(QWidget):
         super().__init__(parent)
         self._grid = QGridLayout(self)
         self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setHorizontalSpacing(6)
-        self._grid.setVerticalSpacing(6)
+        self._grid.setHorizontalSpacing(8)
+        self._grid.setVerticalSpacing(8)
         for col in range(GRID_COLUMNS):
             self._grid.setColumnStretch(col, 1)
         self._views: dict[str, VideoView] = {}
@@ -100,10 +103,7 @@ class ViewHost(QWidget):
     def _mime_source(
         event: QDragEnterEvent | QDragMoveEvent | QDropEvent,
     ) -> str | None:
-        mime = event.mimeData()
-        if mime is None or not mime.hasFormat(VIEW_MIME):
-            return None
-        return bytes(mime.data(VIEW_MIME).data()).decode("ascii", errors="ignore") or None
+        return decode_view_id(event.mimeData())
 
     def _pane_at(self, pos: QPoint) -> VideoView | None:
         """Pane under the pointer; nearest pane when the pointer is in a gap."""
@@ -184,26 +184,26 @@ class ViewHost(QWidget):
         view, zone = self._indicator
         geom = view.geometry()
         if zone == ZONE_LEFT:
-            if geom.left() - 5 < 0:
+            if geom.left() - 6 < 0:
                 return  # outer edge: no gap, the pane border highlights instead
-            rect = QRectF(geom.left() - 5, geom.top() + 2, 4, geom.height() - 4)
+            rect = QRectF(geom.left() - 6, geom.top() + 2, 4, geom.height() - 4)
         elif zone == ZONE_RIGHT:
-            if geom.right() + 6 > self.width():
+            if geom.right() + 7 > self.width():
                 return
-            rect = QRectF(geom.right() + 2, geom.top() + 2, 4, geom.height() - 4)
+            rect = QRectF(geom.right() + 3, geom.top() + 2, 4, geom.height() - 4)
         elif zone == ZONE_TOP:
-            if geom.top() - 5 < 0:
+            if geom.top() - 6 < 0:
                 return
             # A new row always spans the full grid width, not just the target.
-            rect = QRectF(2, geom.top() - 5, self.width() - 4, 4)
+            rect = QRectF(2, geom.top() - 6, self.width() - 4, 4)
         elif zone == ZONE_BOTTOM:
-            if geom.bottom() + 6 > self.height():
+            if geom.bottom() + 7 > self.height():
                 return
-            rect = QRectF(2, geom.bottom() + 2, self.width() - 4, 4)
+            rect = QRectF(2, geom.bottom() + 3, self.width() - 4, 4)
         else:
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#0a84ff"))
+        painter.setBrush(QColor(ACCENT_BLUE))
         painter.drawRoundedRect(rect, 2.0, 2.0)
