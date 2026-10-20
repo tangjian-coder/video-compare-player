@@ -19,6 +19,25 @@ def drift_ms(drift: float | None) -> str:
     return f"{drift * 1000:+.1f}ms" if drift is not None else "n/a"
 
 
+def format_pair(master_view: ViewId, vid: ViewId, offset: float, *, seconds: bool = True) -> str:
+    """Compact ``BA +0.040s`` pair label."""
+    suffix = "s" if seconds else ""
+    return f"{master_view.upper()}{vid.upper()} {offset:+.3f}{suffix}"
+
+
+def format_sync_chip(offsets: dict[ViewId, float], master_view: ViewId) -> tuple[str, str]:
+    """Chip text and QSS state for the current offsets."""
+    if not offsets:
+        return ("● not synced", "off")
+    if len(offsets) == 1:
+        (off,) = offsets.values()
+        return (f"● {off:+.3f}s", "on")
+    inner = " · ".join(
+        format_pair(master_view, vid, off, seconds=False) for vid, off in offsets.items()
+    )
+    return (f"● {inner}", "on")
+
+
 def format_live_status(
     master: float,
     offsets: dict[ViewId, float],

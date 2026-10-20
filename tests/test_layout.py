@@ -118,13 +118,6 @@ def test_swap() -> None:
     assert pane_layout.swap([["a", "b"]], "a", "a") == [["a", "b"]]
 
 
-def test_normalize_fills_and_drops() -> None:
-    assert pane_layout.normalize([["a", "x"], ["a", "b"], []], ["a", "b", "c"]) == [
-        ["a", "c"],
-        ["b"],
-    ]
-
-
 def test_is_valid() -> None:
     assert pane_layout.is_valid([["a", "b"]], ["a", "b"])
     assert not pane_layout.is_valid([["a"]], ["a", "b"])

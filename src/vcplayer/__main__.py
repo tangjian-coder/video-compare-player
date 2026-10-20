@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .config import LOG_DIR
+from .ui.layout import MAX_VIEWS
 
 
 def _setup_logging(debug: bool) -> None:
@@ -50,8 +51,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--debug", action="store_true", help="enable debug logging")
     args = parser.parse_args(argv)
-    if len(args.videos) > 4:
-        parser.error("at most 4 videos (one per view)")
+    if len(args.videos) > MAX_VIEWS:
+        parser.error(f"at most {MAX_VIEWS} videos (one per view)")
 
     _setup_logging(args.debug)
     logger = logging.getLogger(__name__)

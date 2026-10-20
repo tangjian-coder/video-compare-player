@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from vcplayer.ui.status_presenter import PlayheadSmoother, drift_ms, format_live_status
+from vcplayer.ui.status_presenter import (
+    PlayheadSmoother,
+    drift_ms,
+    format_live_status,
+    format_pair,
+    format_sync_chip,
+)
 
 
 def test_drift_ms_formats_and_handles_none() -> None:
@@ -45,6 +51,16 @@ def test_status_three_offsets_uses_summary_and_tooltip() -> None:
     assert "max drift +3.0ms" in readout.text
     assert "AB +0.040s" in readout.tooltip
     assert "AD +0.200s" in readout.tooltip
+
+
+def test_pair_and_chip_share_one_format() -> None:
+    assert format_pair("b", "a", 0.04) == "BA +0.040s"
+    assert format_sync_chip({}, "a") == ("● not synced", "off")
+    assert format_sync_chip({"b": 0.04}, "a") == ("● +0.040s", "on")
+    assert format_sync_chip({"a": 0.04, "c": -0.12}, "b") == (
+        "● BA +0.040 · BC -0.120",
+        "on",
+    )
 
 
 def test_playhead_smoother_interpolates_and_clamps() -> None:

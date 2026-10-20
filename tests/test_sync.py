@@ -14,6 +14,7 @@ class FakePlayer:
     time_pos: float | None = 0.0
     duration: float | None = 10.0
     fps: float | None = 100.0
+    is_ready: bool = True
     paused: bool = True
     speed: float = 1.0
     seeks: list[float] = field(default_factory=list)
@@ -91,24 +92,6 @@ def test_master_range_negative_offset() -> None:
     assert eng.master_range() == (2.0, 10.0)  # lo = -offset
 
 
-def test_seek_master_clamps_and_maps() -> None:
-    eng, a, b = make_engine(offset_a=2.0, offset_b=5.0)
-    a.duration = b.duration = 10.0
-    m = eng.seek_master(99.0)
-    assert m == pytest.approx(7.0)  # hi = min(10, 10 - 3)
-    assert a.seeks[-1] == pytest.approx(7.0)
-    assert b.seeks[-1] == pytest.approx(10.0)  # m + offset
-
-
-def test_seek_master_clamps_to_lower_bound_negative_offset() -> None:
-    eng, a, b = make_engine(offset_a=5.0, offset_b=3.0)  # offset -2
-    a.duration = b.duration = 10.0
-    m = eng.seek_master(0.0)  # below lo = 2
-    assert m == pytest.approx(2.0)
-    assert a.seeks[-1] == pytest.approx(2.0)
-    assert b.seeks[-1] == pytest.approx(0.0)  # m + offset
-
-
 def test_master_range_empty_when_b_ends_before_a_starts() -> None:
     # offset +5 with B only 3s long: no overlap at all.
     eng, a, b = make_engine(offset_a=0.0, offset_b=5.0)
@@ -121,15 +104,6 @@ def test_master_range_raises_when_unloaded() -> None:
     b.duration = None
     with pytest.raises(SyncError):
         eng.master_range()
-
-
-def test_seek_master_coarse_uses_fast_seeks() -> None:
-    eng, a, b = make_engine(offset_a=2.0, offset_b=5.0)
-    m = eng.seek_master(3.0, exact=False)
-    assert m == pytest.approx(3.0)
-    assert a.fast_seeks[-1] == pytest.approx(3.0)
-    assert b.fast_seeks[-1] == pytest.approx(6.0)
-    assert a.seeks == [] and b.seeks == []
 
 
 def test_force_resync_aligns_b_to_a() -> None:
@@ -206,22 +180,6 @@ def test_view_time_mapping() -> None:
     assert eng.view_time("a", 1.0) == 1.0
     assert eng.view_time("b", 1.0) == pytest.approx(4.0)
     assert eng.view_time("a", 1.0, "b") == pytest.approx(4.0)
-
-
-def test_step_advances_one_reference_frame() -> None:
-    eng, a, b = make_engine()
-    a.time_pos = 5.0
-    eng.step(1)
-    assert a.seeks[-1] == pytest.approx(5.01)  # 1 / 100fps
-    assert b.seeks[-1] == pytest.approx(5.01)
-    assert a.paused and b.paused
-
-
-def test_step_backwards() -> None:
-    eng, a, _ = make_engine()
-    a.time_pos = 5.0
-    eng.step(-2)
-    assert a.seeks[-1] == pytest.approx(4.98)
 
 
 def test_drift_sign() -> None:
@@ -381,17 +339,16 @@ def test_regulate_skips_repeated_identical_writes() -> None:
     assert len(b.speeds) == 1  # first write applied, repeats skipped
 
 
-def test_master_time_raises_when_unloaded() -> None:
-    eng, a, _ = make_engine()
-    a.time_pos = None
-    with pytest.raises(SyncError):
-        eng.master_time()
-
-
 def test_ready_requires_both_durations() -> None:
     eng, a, b = make_engine()
     assert eng.ready
     b.duration = None
+    assert not eng.ready
+
+
+def test_ready_requires_both_players_fully_loaded() -> None:
+    eng, a, _b = make_engine()
+    a.is_ready = False
     assert not eng.ready
 
 

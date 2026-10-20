@@ -1,15 +1,15 @@
 """Screen recording of the comparison panes via an ffmpeg subprocess.
 
-Records the on-screen region covered by the side-by-side video area
-(no timeline / transport / status bar) so aligned A/B playback can be
+Records the on-screen region covered by the 2-4 pane grid
+(no timeline / transport / status bar) so aligned playback can be
 captured as clean demonstration clips.
 
 Design:
 - ffmpeg runs as an independent process (QProcess): capture + encode
   never occupy the Python thread pool or the GIL, leaving the
   latency-sensitive sync regulation loop untouched.
-- ddagrab + NVENC hardware encoding when available, otherwise
-  gdigrab + libx264 (portable, works everywhere).
+- ddagrab + NVENC hardware encoding when available; otherwise the
+  probe selects ddagrab+x264 or gdigrab+x264 when supported.
 - Stop is graceful ("q" on stdin) with a force-kill fallback and a
   remux repair path for a damaged mp4 tail.
 """
@@ -27,7 +27,14 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
+from PySide6.QtCore import (
+    QObject,
+    QProcess,
+    QProcessEnvironment,
+    QStandardPaths,
+    QTimer,
+    Signal,
+)
 
 if TYPE_CHECKING:
     from PySide6.QtWidgets import QWidget
@@ -59,7 +66,6 @@ class RecorderState(Enum):
 class EncoderProfile:
     """One capture+encode pipeline variant."""
 
-    name: str
     capture: str  # "ddagrab" | "gdigrab"
     encoder: str  # "h264_nvenc" | "libx264"
     encode_args: tuple[str, ...]
@@ -67,7 +73,6 @@ class EncoderProfile:
 
 
 _NVENC_PROFILE = EncoderProfile(
-    name="ddagrab-nvenc",
     capture="ddagrab",
     encoder="h264_nvenc",
     encode_args=("-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"),
@@ -75,7 +80,6 @@ _NVENC_PROFILE = EncoderProfile(
 )
 
 _DDAGRAB_X264_PROFILE = EncoderProfile(
-    name="ddagrab-x264",
     capture="ddagrab",
     encoder="libx264",
     encode_args=("-c:v", "libx264", "-preset", "veryfast", "-crf", "18"),
@@ -83,7 +87,6 @@ _DDAGRAB_X264_PROFILE = EncoderProfile(
 )
 
 _GDIGRAB_PROFILE = EncoderProfile(
-    name="gdigrab-x264",
     capture="gdigrab",
     encoder="libx264",
     encode_args=("-c:v", "libx264", "-preset", "veryfast", "-crf", "18"),
@@ -388,7 +391,9 @@ def clamp_region_to_desktop(region: Region, screens: list[ScreenRect]) -> Region
 
 def default_output_dir() -> Path:
     """User's Videos library, with a vcplayer subfolder."""
-    return Path.home() / "Videos" / "vcplayer"
+    movies = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.MoviesLocation)
+    base = Path(movies) if movies else Path.home() / "Videos"
+    return base / "vcplayer"
 
 
 def unique_output_path(directory: Path, timestamp: str) -> Path:
@@ -504,33 +509,6 @@ def repair_command(ffmpeg: Path, path: Path, fixed: Path) -> list[str]:
         "copy",
         str(fixed),
     ]
-
-
-def repair_mp4(ffmpeg: Path, path: Path) -> bool:
-    """Remux a file whose tail was damaged by a force-kill.
-
-    Only helps when ffmpeg got far enough to write the moov atom; a
-    hard-killed file without moov is unrecoverable (returns False).
-    """
-    if not path.is_file():
-        return False
-    fixed = path.with_suffix(".fixed.mp4")
-    res = subprocess.run(
-        repair_command(ffmpeg, path, fixed),
-        capture_output=True,
-        timeout=60,
-        check=False,
-        creationflags=_NO_WINDOW,
-    )
-    if res.returncode == 0 and fixed.is_file() and fixed.stat().st_size > 0:
-        try:
-            fixed.replace(path)
-            return True
-        except OSError:
-            logger.warning("could not replace damaged clip with repaired copy")
-    with contextlib.suppress(OSError):
-        fixed.unlink()
-    return False
 
 
 class ScreenRecorder(QObject):

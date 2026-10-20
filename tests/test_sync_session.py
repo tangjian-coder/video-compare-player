@@ -12,6 +12,7 @@ class FakePlayer:
     def __init__(self, duration: float = 10.0) -> None:
         self.duration = duration
         self.fps = 60.0
+        self.is_ready = True
         self.time_pos = 0.0
         self.playback_time = None
         self.seeks: list[float] = []
@@ -56,11 +57,21 @@ def test_invalidate_master_clears_every_pair() -> None:
 
 def test_set_master_rebuilds_engines_around_new_reference() -> None:
     session, a, b = make_session()
-    session.set_master("b")
+    assert session.set_master("b")
     assert session.master == "b"
     assert set(session.engines) == {"a"}
     engine = session.engines["a"]
     assert engine.a is b and engine.b is a
+
+
+def test_set_master_is_idempotent_and_validated() -> None:
+    session, _a, _b = make_session()
+    session.engines["b"].state.point_a = 1.0
+    session.engines["b"].state.point_b = 2.0
+    assert not session.set_master("a")
+    assert session.engines["b"].state.is_complete
+    assert not session.set_master("z")  # type: ignore[arg-type]
+    assert session.master == "a"
 
 
 def test_remove_view_drops_its_engine() -> None:

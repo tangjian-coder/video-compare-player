@@ -19,7 +19,7 @@ from .models import SyncState
 
 logger = logging.getLogger(__name__)
 
-# "a" is the master view; b/c/d are followers (one engine per follower).
+# View ids; each engine's `a` is the current reference, `b` its follower.
 ViewId = Literal["a", "b", "c", "d"]
 
 # regulate() tuning constants (measured; see regulate docstring).
@@ -41,6 +41,9 @@ class PlayerLike(Protocol):
     """Minimal player interface required by SyncEngine."""
 
     @property
+    def is_ready(self) -> bool: ...
+
+    @property
     def time_pos(self) -> float | None: ...
 
     @property
@@ -52,8 +55,6 @@ class PlayerLike(Protocol):
     def seek_exact(self, t: float) -> None: ...
 
     def seek_fast(self, t: float) -> None: ...
-
-    def pause(self) -> None: ...
 
     def set_speed(self, speed: float) -> None: ...
 
@@ -110,9 +111,14 @@ class SyncEngine:
 
     @property
     def ready(self) -> bool:
-        """True when both players have a usable duration."""
+        """True when both players are fully loaded with usable durations."""
         return bool(
-            self.a.duration and self.a.duration > 0 and self.b.duration and self.b.duration > 0
+            self.a.is_ready
+            and self.b.is_ready
+            and self.a.duration
+            and self.a.duration > 0
+            and self.b.duration
+            and self.b.duration > 0
         )
 
     @property
@@ -120,10 +126,6 @@ class SyncEngine:
         """Frame rate of the reference view; fallback 25 fps."""
         fps = self.a.fps
         return fps if fps and fps > 0 else 25.0
-
-    def master_time(self) -> float:
-        """Current master position (the reference view's timeline)."""
-        return self._require_time(self.a)
 
     def master_range(self) -> tuple[float, float]:
         """Valid master interval where both views have frames."""
@@ -136,21 +138,6 @@ class SyncEngine:
     def view_time(self, view: ViewId, master: float, master_view: ViewId = "a") -> float:
         """Map a master position to a view-local time."""
         return master if view == master_view else master + self.offset
-
-    def seek_master(self, master: float, *, exact: bool = True) -> float:
-        """Seek both views to a master position; returns the clamped position.
-
-        exact=False uses keyframe-fast seeks: coarse but cheap, for scrubbing.
-        """
-        lo, hi = self.master_range()
-        m = min(max(master, lo), hi)
-        if exact:
-            self.a.seek_exact(m)
-            self.b.seek_exact(m + self.offset)
-        else:
-            self.a.seek_fast(m)
-            self.b.seek_fast(m + self.offset)
-        return m
 
     def seek_follower(self, master: float, *, exact: bool = True) -> None:
         """Seek only the follower to the aligned position of `master`.
@@ -168,11 +155,11 @@ class SyncEngine:
             self.b.seek_fast(target)
 
     def force_resync(self) -> None:
-        """Hard-align B onto A's aligned time right now (startup stabilizer).
+        """Hard-align B onto A's aligned time right now.
 
-        The follower's target is clamped to its own stream: when the reference sits outside the
-        common range a perfectly aligned B position may not exist, and an
-        explicit clamp (unlike mpv's silent one) keeps the seek deliberate.
+        The follower's target is clamped to its own stream: when the reference
+        sits outside the common range a perfectly aligned B position may not
+        exist, and an explicit clamp keeps the seek deliberate.
         """
         target = self._require_time(self.a) + self.offset
         dur_b = self.b.duration
@@ -196,12 +183,6 @@ class SyncEngine:
             return False
         self.force_resync()
         return True
-
-    def step(self, frames: int) -> float:
-        """Pause and step both views by N reference frames; returns new master."""
-        self.a.pause()
-        self.b.pause()
-        return self.seek_master(self.master_time() + frames / self.reference_fps)
 
     # -- drift handling ---------------------------------------------------------
 

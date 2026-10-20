@@ -94,7 +94,6 @@ def run(videos: Sequence[Path] | None = None) -> int:
     _prepare_libmpv_path()
     _prepare_timer_resolution()
     _set_app_user_model_id()
-    sys.setswitchinterval(0.001)  # the lockstep worker is latency-sensitive
 
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication

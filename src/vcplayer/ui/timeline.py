@@ -91,7 +91,7 @@ class TimelineWidget(QWidget):
         self.setMinimumHeight(tracks_height(len(self._views)))
 
     def _init_state(self) -> None:
-        """Plain-Python state, split out for the no-Qt test fixture."""
+        """Initialize the render-state tables."""
         self._views: list[ViewId] = ["a", "b"]
         self._master: ViewId = "a"
         self._dur: dict[ViewId, float | None] = {}
@@ -157,10 +157,16 @@ class TimelineWidget(QWidget):
 
     def set_durations(self, durs: Mapping[ViewId, float | None]) -> None:
         """Set each track's full scale; None marks an unloaded view."""
+        changed = False
         for view, dur in durs.items():
             if view not in self._views:
                 continue
-            self._dur[view] = dur if dur and dur > 0 else None
+            normalized = dur if dur and dur > 0 else None
+            if view not in self._dur or self._dur[view] != normalized:
+                self._dur[view] = normalized
+                changed = True
+        if not changed:
+            return
         if self._hover_view is not None and not self._is_loaded(self._hover_view):
             self._set_hover(None)
         if self._drag_view is not None and not self._is_loaded(self._drag_view):

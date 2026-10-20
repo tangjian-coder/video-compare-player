@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +82,15 @@ class PlayerError(RuntimeError):
     """Raised when libmpv is unavailable or a file cannot be loaded."""
 
 
+class LoadState(Enum):
+    """Lifecycle of the current media file in one player."""
+
+    EMPTY = "empty"
+    LOADING = "loading"
+    READY = "ready"
+    FAILED = "failed"
+
+
 class PlayerController:
     """Controls one embedded libmpv instance."""
 
@@ -108,6 +119,9 @@ class PlayerController:
             loglevel="warn",
         )
         self._meta: VideoMeta | None = None
+        self._load_state = LoadState.EMPTY
+        self._load_error: str | None = None
+        self._expected_path: Path | None = None
         self._terminated = False
         # Display rotation in degrees (0/90/180/270). Tracked locally:
         # rotating through the property avoids round-trip reads entirely.
@@ -131,9 +145,9 @@ class PlayerController:
 
     def try_capture_meta(self) -> VideoMeta | None:
         """Poll-based metadata capture; returns meta once the file is demuxed."""
-        if self._meta is not None:
+        if self._meta is not None or self._load_state is LoadState.READY:
             return self._meta
-        if self._terminated:
+        if self._terminated or self._load_state is not LoadState.LOADING:
             return None
         try:
             duration, fps = self.duration, self.fps
@@ -146,21 +160,70 @@ class PlayerController:
             logger.debug("metadata not ready", exc_info=True)
             return None
         if duration and fps and width and height and path:
+            loaded_path = Path(path)
+            try:
+                same_path = self._expected_path is None or os.path.normcase(
+                    str(loaded_path.resolve())
+                ) == os.path.normcase(str(self._expected_path.resolve()))
+            except OSError:
+                same_path = False
+            if not same_path:
+                return None  # stale path from the previous loadfile
             self._meta = VideoMeta(
-                path=Path(path),
+                path=loaded_path,
                 duration=float(duration),
                 fps=float(fps),
                 width=int(width),
                 height=int(height),
             )
+            self._load_state = LoadState.READY
+            self._load_error = None
             logger.info("loaded: %s", self._meta)
         return self._meta
+
+    def mark_load_failed(self, message: str) -> None:
+        """Make a failed load terminal: stop the core and clear old media."""
+        if not self._terminated:
+            try:
+                self._mpv.command("stop")
+            except (AttributeError, RuntimeError, SystemError) as exc:
+                logger.warning("failed to stop after load error: %s", exc)
+            try:
+                self.reset_view()
+            except Exception as exc:  # a dead core must not block state reset
+                logger.warning("failed to reset after load error: %s", exc)
+        self._meta = None
+        self._expected_path = None
+        self._load_state = LoadState.FAILED
+        self._load_error = message
 
     # -- properties ---------------------------------------------------------
 
     @property
+    def load_state(self) -> LoadState:
+        """Current media load lifecycle."""
+        return self._load_state
+
+    @property
+    def load_error(self) -> str | None:
+        """Human-readable reason for the last failed load."""
+        return self._load_error
+
+    @property
+    def is_loading(self) -> bool:
+        return self._load_state is LoadState.LOADING
+
+    @property
+    def is_ready(self) -> bool:
+        return self._load_state is LoadState.READY
+
+    @property
+    def is_failed(self) -> bool:
+        return self._load_state is LoadState.FAILED
+
+    @property
     def meta(self) -> VideoMeta | None:
-        """Video metadata, available once the file-loaded event fired."""
+        """Video metadata, available once the file is fully demuxed."""
         return self._meta
 
     @property
@@ -249,11 +312,27 @@ class PlayerController:
             raise PlayerError(f"file not found: {path}")
         if self._terminated:
             return
+        previous_meta = self._meta
+        previous_state = self._load_state
+        previous_path = self._expected_path
+        previous_error = self._load_error
+        try:
+            expected_path = path.resolve()
+        except OSError as exc:
+            raise PlayerError(f"cannot resolve {path}: {exc}") from exc
         self._meta = None
+        self._load_state = LoadState.LOADING
+        self._load_error = None
+        self._expected_path = expected_path
         logger.info("loading %s", path)
         try:
             self._mpv.command("loadfile", str(path))
         except SystemError as exc:  # mpv wraps command failures in SystemError
+            # The old file is still in the core: restore its state.
+            self._meta = previous_meta
+            self._load_state = previous_state
+            self._expected_path = previous_path
+            self._load_error = previous_error
             raise PlayerError(f"failed to load {path}: {exc}") from exc
         # The OSD overlay normally survives a loadfile; re-assert anyway
         # so a core that dropped it cannot silently lose the crosshair.
@@ -267,6 +346,9 @@ class PlayerController:
         if self._terminated:
             return
         self._meta = None
+        self._load_state = LoadState.EMPTY
+        self._load_error = None
+        self._expected_path = None
         try:
             self._mpv.command("stop")
         except SystemError as exc:  # mpv wraps command failures in SystemError

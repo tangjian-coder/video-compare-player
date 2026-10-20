@@ -26,6 +26,18 @@ ZONE_TOP = "top"
 ZONE_BOTTOM = "bottom"
 ZONE_CENTER = "center"
 
+_ZONE_PREPOSITIONS = {
+    ZONE_LEFT: "left of",
+    ZONE_RIGHT: "right of",
+    ZONE_TOP: "above",
+    ZONE_BOTTOM: "below",
+}
+
+
+def zone_preposition(zone: str) -> str:
+    """Human-readable drop position for status messages."""
+    return _ZONE_PREPOSITIONS.get(zone, "beside")
+
 
 def default_layout(view_ids: Sequence[str]) -> Layout:
     """Default arrangement for the given number of views."""
@@ -85,30 +97,6 @@ def is_valid(layout: Layout, view_ids: Sequence[str]) -> bool:
     if sorted(flat) != sorted(view_ids):
         return False
     return all(1 <= len(row) <= MAX_VIEWS for row in layout)
-
-
-def normalize(layout: Layout, view_ids: Sequence[str]) -> Layout:
-    """Drop unknown/duplicate views and append any missing ones."""
-    valid = set(view_ids)
-    seen: set[str] = set()
-    rows: Layout = []
-    for views in layout:
-        kept: Row = []
-        for vid in views:
-            if vid in valid and vid not in seen:
-                seen.add(vid)
-                kept.append(vid)
-        if kept:
-            rows.append(kept)
-    for vid in view_ids:
-        if vid in seen:
-            continue
-        if not rows:
-            rows = [[vid]]
-            continue
-        shortest = min(range(len(rows)), key=lambda i: len(rows[i]))
-        rows[shortest].append(vid)
-    return rows
 
 
 def drop_view(layout: Layout, vid: str) -> Layout:

@@ -18,7 +18,6 @@ from vcplayer.core.recorder import (
     physical_region,
     region_fully_on_screens,
     region_within,
-    repair_mp4,
     unique_output_path,
 )
 
@@ -158,12 +157,22 @@ def test_unique_output_path_suffixes_collisions(tmp_path: Path) -> None:
 
 def _profile(capture: str = "gdigrab") -> EncoderProfile:
     return EncoderProfile(
-        name=f"{capture}-x264",
         capture=capture,
         encoder="libx264",
         encode_args=("-c:v", "libx264", "-crf", "18"),
         fps=30,
     )
+
+
+def test_default_output_dir_uses_movies_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vcplayer.core import recorder as rec_mod
+
+    monkeypatch.setattr(rec_mod.QStandardPaths, "writableLocation", lambda _location: str(tmp_path))
+    assert rec_mod.default_output_dir() == tmp_path / "vcplayer"
+    monkeypatch.setattr(rec_mod.QStandardPaths, "writableLocation", lambda _location: "")
+    assert rec_mod.default_output_dir() == Path.home() / "Videos" / "vcplayer"
 
 
 def test_build_args_gdigrab() -> None:
@@ -181,7 +190,6 @@ def test_build_args_gdigrab() -> None:
 
 def test_build_args_ddagrab_native_region() -> None:
     prof = EncoderProfile(
-        name="ddagrab-nvenc",
         capture="ddagrab",
         encoder="h264_nvenc",
         encode_args=("-c:v", "h264_nvenc", "-cq", "23"),
@@ -198,21 +206,9 @@ def test_build_args_ddagrab_native_region() -> None:
     assert args[args.index("-profile:v") + 1] == "main"
 
 
-def test_constrain_removed_use_capture_support() -> None:
-    """The off-primary decision now lives in CaptureSupport (see below)."""
-    from vcplayer.core.recorder import _GDIGRAB_PROFILE, _NVENC_PROFILE, CaptureSupport
-
-    support = CaptureSupport(primary=_NVENC_PROFILE, off_primary=_GDIGRAB_PROFILE)
-    assert support.primary.capture == "ddagrab"
-    assert support.off_primary is not None
-    bare = CaptureSupport(primary=_NVENC_PROFILE, off_primary=None)
-    assert bare.off_primary is None
-
-
 def test_build_args_ddagrab_x264_downloads_frames() -> None:
     """DDA capture + CPU encode must hwdownload into system memory."""
     prof = EncoderProfile(
-        name="ddagrab-x264",
         capture="ddagrab",
         encoder="libx264",
         encode_args=("-c:v", "libx264", "-crf", "18"),
@@ -391,13 +387,6 @@ def test_elapsed_seconds_idle_is_zero(recorder: ScreenRecorder) -> None:
     assert recorder.elapsed_seconds() == 0.0
 
 
-# -- repair_mp4 ------------------------------------------------------------------
-
-
-def test_repair_missing_file_is_false(tmp_path: Path) -> None:
-    assert repair_mp4(Path("ffmpeg.exe"), tmp_path / "nope.mp4") is False
-
-
 # -- Crash / exception paths (review MAJOR findings) ------------------------------
 
 
@@ -491,26 +480,3 @@ def test_probe_subprocesses_suppress_console_windows(
     assert calls
     for c in calls:
         assert c["kwargs"]["creationflags"] == real_subprocess.CREATE_NO_WINDOW
-
-
-def test_repair_mp4_suppresses_console_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import subprocess as real_subprocess
-
-    from vcplayer.core import recorder as rec_mod
-
-    captured: dict[str, object] = {}
-
-    class _FakeCompleted:
-        returncode = 1
-
-    def fake_run(cmd: list[str], **kwargs: object) -> object:
-        captured.update(kwargs)
-        return _FakeCompleted()
-
-    monkeypatch.setattr(rec_mod.subprocess, "run", fake_run)
-    clip = tmp_path / "clip.mp4"
-    clip.write_bytes(b"x" * 16)
-    assert rec_mod.repair_mp4(Path("ffmpeg.exe"), clip) is False
-    assert captured["creationflags"] == real_subprocess.CREATE_NO_WINDOW

@@ -92,8 +92,6 @@ def _draw(painter: QPainter, name: str, color: str) -> None:
         for x in (3.5, 11.0):
             for y in (3.5, 11.0):
                 painter.drawRoundedRect(QRectF(x, y, 5.5, 5.5), 1.5, 1.5)
-    elif name == "chevron-down":
-        painter.drawPolyline([QPointF(6.0, 8.0), QPointF(10.0, 12.0), QPointF(14.0, 8.0)])
     elif name == "x":
         painter.drawLine(QPointF(6.0, 6.0), QPointF(14.0, 14.0))
         painter.drawLine(QPointF(14.0, 6.0), QPointF(6.0, 14.0))

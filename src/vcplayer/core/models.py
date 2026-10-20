@@ -16,11 +16,6 @@ class VideoMeta:
     width: int
     height: int
 
-    @property
-    def frame_count(self) -> int:
-        """Total frame count derived from duration and fps."""
-        return round(self.duration * self.fps)
-
 
 @dataclass
 class SyncState:

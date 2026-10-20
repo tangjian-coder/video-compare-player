@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QColor, QPainter, QPaintEvent, QPen
-from PySide6.QtWidgets import QComboBox
+from PySide6.QtWidgets import QComboBox, QWidget
+
+
+def set_style_property(widget: QWidget, name: str, value: object) -> None:
+    """Set a dynamic QSS property and force one style re-evaluation."""
+    if widget.property(name) == value:
+        return
+    widget.setProperty(name, value)
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
 
 
 class ChevronComboBox(QComboBox):

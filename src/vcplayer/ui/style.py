@@ -327,10 +327,6 @@ QLabel#placeholderHint {
     color: #5c6166;
     font-size: 9pt;
 }
-QLabel#placeholderLabel {
-    color: #5c6166;
-    font-size: 12pt;
-}
 QLabel#timeLabel {
     color: #8e8e93;
     font-family: "Cascadia Mono", Consolas, monospace;

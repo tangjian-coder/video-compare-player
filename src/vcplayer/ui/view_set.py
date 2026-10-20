@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import cast
 
 from ..core.sync import ViewId
 from .video_view import VideoView
@@ -39,7 +38,7 @@ class ViewSet:
         self._active = view
 
     def add(self, view: VideoView) -> None:
-        vid = cast(ViewId, view.view_name.lower())
+        vid = view.view_id
         if vid in self._views:
             raise ValueError(f"duplicate view id: {vid}")
         self._views[vid] = view
@@ -51,12 +50,3 @@ class ViewSet:
         if self._active == vid:
             self._active = next(iter(self._views), None)
         return view
-
-    def get(self, vid: ViewId) -> VideoView | None:
-        return self._views.get(vid)
-
-    def __contains__(self, vid: object) -> bool:
-        return vid in self._views
-
-    def __len__(self) -> int:
-        return len(self._views)

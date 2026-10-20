@@ -22,16 +22,17 @@ class SyncSession:
         self.master: ViewId = "a"
         self.engines: dict[ViewId, SyncEngine] = {}
 
-    def add_follower(self, view: ViewId) -> None:
+    def add_follower(self, view: ViewId) -> bool:
         """Create the engine for one newly added follower view."""
         views = self._views()
         master = views.get(self.master)
         pane = views.get(view)
         if master is None or pane is None:
-            return
+            return False
         if not master.surface.has_player or not pane.surface.has_player:
-            return
+            return False
         self.engines[view] = SyncEngine(master.player, pane.player)
+        return True
 
     def rebuild(self) -> None:
         """Recreate every follower engine against the current master."""
@@ -45,14 +46,35 @@ class SyncSession:
                 continue
             self.engines[vid] = SyncEngine(master.player, pane.player)
 
-    def set_master(self, master: ViewId) -> None:
-        """Switch the reference view and rebuild all follower engines."""
+    def set_master(self, master: ViewId) -> bool:
+        """Switch the reference view and rebuild all follower engines.
+
+        Idempotent and validated: an invalid or unchanged master does not
+        discard the current anchors.
+        """
+        views = self._views()
+        pane = views.get(master)
+        if pane is None or not pane.surface.has_player:
+            return False
+        if master == self.master:
+            return False
         self.master = master
         self.rebuild()
+        return True
 
-    def remove_view(self, view: ViewId) -> None:
-        """Drop a removed view's engine."""
+    def remove_view(self, view: ViewId, *, replacement: ViewId | None = None) -> bool:
+        """Drop a removed view's engine, promoting a replacement if needed."""
+        was_master = view == self.master
         self.engines.pop(view, None)
+        if not was_master:
+            return False
+        views = self._views()
+        candidate = replacement if replacement in views else None
+        if candidate is None:
+            candidate = next((vid for vid in views if vid != view), None)
+        self.master = candidate if candidate is not None else "a"
+        self.rebuild()
+        return True
 
     @property
     def master_player(self) -> PlayerController:
@@ -117,9 +139,13 @@ class SyncSession:
                 error = str(exc)
         return offsets, error
 
+    def affected_by(self, view: ViewId) -> list[ViewId]:
+        """Follower engines whose anchors involve a reloaded view."""
+        return list(self.engines) if view == self.master else [view]
+
     def invalidate(self, view: ViewId) -> list[ViewId]:
         """Clear anchors involving a reloaded view; returns cleared followers."""
-        affected = list(self.engines) if view == self.master else [view]
+        affected = self.affected_by(view)
         cleared: list[ViewId] = []
         for vid in affected:
             eng = self.engines.get(vid)

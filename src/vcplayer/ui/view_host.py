@@ -8,6 +8,9 @@ path that detaches a terminated pane).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import cast
+
 from PySide6.QtCore import QPoint, QRectF, Qt
 from PySide6.QtGui import (
     QColor,
@@ -20,6 +23,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QGridLayout, QWidget
 
+from ..core.sync import ViewId
 from .layout import (
     GRID_COLUMNS,
     ZONE_BOTTOM,
@@ -46,7 +50,7 @@ class ViewHost(QWidget):
         self._grid.setVerticalSpacing(8)
         for col in range(GRID_COLUMNS):
             self._grid.setColumnStretch(col, 1)
-        self._views: dict[str, VideoView] = {}
+        self._views: dict[ViewId, VideoView] = {}
         self._rows = 0
         # Pane drags: the host accepts them everywhere (including the gaps
         # between panes) so the OS never shows a "forbidden" cursor inside
@@ -57,8 +61,8 @@ class ViewHost(QWidget):
         self._indicator: tuple[VideoView, str] | None = None
 
     @property
-    def views(self) -> dict[str, VideoView]:
-        """Views currently hosted, keyed by lowercase view id."""
+    def views(self) -> dict[ViewId, VideoView]:
+        """Views currently hosted, keyed by view id."""
         return dict(self._views)
 
     @property
@@ -66,13 +70,9 @@ class ViewHost(QWidget):
         """Number of hosted views."""
         return len(self._views)
 
-    def add_view(self, view: VideoView) -> None:
-        """Register a pane; it is placed by the next apply_layout()."""
-        self._views[view.view_name.lower()] = view
-
     def remove_view(self, view: VideoView) -> None:
         """Detach a doomed pane from the grid (only during teardown)."""
-        vid = view.view_name.lower()
+        vid = view.view_id
         if self._views.get(vid) is view:
             del self._views[vid]
         if self._drop_pane is view:
@@ -82,17 +82,28 @@ class ViewHost(QWidget):
         self._grid.removeWidget(view)
         view.setParent(None)
 
-    def apply_layout(self, layout: Layout) -> None:
-        """Place every hosted pane according to the row-list layout."""
+    def apply_layout(self, layout: Layout, views: Mapping[ViewId, VideoView]) -> None:
+        """Place the given panes; detach any pane no longer in the mapping."""
+        incoming = dict(views)
+        for view in self._views.values():
+            if view not in incoming.values():
+                self._grid.removeWidget(view)
+                view.hide()  # keep the native surface parented; teardown owns disposal
+        if self._drop_pane is not None and self._drop_pane not in incoming.values():
+            self._drop_pane = None
+        if self._indicator is not None and self._indicator[0] not in incoming.values():
+            self._indicator = None
+        self._views = incoming
         for view in self._views.values():
             self._grid.removeWidget(view)
         while self._rows:
             self._rows -= 1
             self._grid.setRowStretch(self._rows, 0)
-        for vid, row, col, span in cells(layout):
-            pane = self._views.get(vid)
+        for raw_vid, row, col, span in cells(layout):
+            pane = self._views.get(cast(ViewId, raw_vid))
             if pane is not None:
                 self._grid.addWidget(pane, row, col, 1, span)
+                pane.show()
         self._rows = len(layout)
         for row in range(self._rows):
             self._grid.setRowStretch(row, 1)
@@ -123,7 +134,7 @@ class ViewHost(QWidget):
 
     def set_drop_indicator(self, view: VideoView, zone: str | None) -> None:
         """Show/hide the insertion line a pane's drop zone asks the host to draw."""
-        if self._views.get(view.view_name.lower()) is not view:
+        if self._views.get(view.view_id) is not view:
             return
         indicator = None if zone in (None, ZONE_CENTER) else (view, zone)
         if indicator == self._indicator:

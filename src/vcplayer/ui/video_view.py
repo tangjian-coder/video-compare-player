@@ -1,8 +1,8 @@
 """Video display block: titled frame + native mpv surface + per-view controls.
 
 Layout mirrors Kinovea's dual-screen panes: each block has its own header
-(badge + filename), the video surface, and a footer with per-view frame
-stepping and sync controls.
+(badge + filename), the video surface, and a footer with per-view transport,
+rotation and zoom readouts.
 
 Rendering is done by libmpv directly into the surface's native window.
 Zoom/pan use mpv's GPU-side properties (video-zoom / video-pan-x/y).
@@ -11,6 +11,7 @@ Zoom/pan use mpv's GPU-side properties (video-zoom / video-pan-x/y).
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 from PySide6.QtCore import (
     QEvent,
@@ -53,10 +54,12 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.player import PlayerController
+from ..core.sync import ViewId
 from .icons import make_icon
 from .layout import ZONE_CENTER, zone_at
 from .pane_drag import decode_view_id, first_video_path, make_view_mime
 from .theme import ACCENT_BLUE, VIEW_COLORS, on_view_color
+from .widgets import set_style_property
 
 logger = logging.getLogger(__name__)
 
@@ -353,7 +356,7 @@ class MpvSurface(QWidget):
         if source is not None:
             view = self._owning_view()
             if view is not None:
-                if source != view.view_name.lower():
+                if source != view.view_id:
                     view.pane_drag_move(self.mapTo(view, event.position().toPoint()), source)
                 event.acceptProposedAction()
                 return
@@ -366,7 +369,7 @@ class MpvSurface(QWidget):
         view = self._owning_view()
         if source is None or view is None:
             return
-        if source != view.view_name.lower():
+        if source != view.view_id:
             view.pane_drag_move(self.mapTo(view, event.position().toPoint()), source)
         event.acceptProposedAction()
 
@@ -720,7 +723,7 @@ class VideoView(QFrame):
         self._header.drag_finished.connect(self._on_header_drag_finished)
         self._header.clicked.connect(lambda: self.clicked.emit(self.view_name))
         self._header.context_menu_requested.connect(
-            lambda pos: self.context_menu_requested.emit(view_name.lower(), pos)
+            lambda pos: self.context_menu_requested.emit(self.view_id, pos)
         )
         self.surface.clicked.connect(lambda: self.clicked.emit(self.view_name))
         self.surface.file_dropped.connect(self.file_dropped)
@@ -729,7 +732,7 @@ class VideoView(QFrame):
         # that can serve a stale value inside the slot call chain).
         self.surface.zoom_changed.connect(self._on_zoom_changed)
         self.btn_rotate.clicked.connect(self._on_rotate)
-        self.btn_clear.clicked.connect(lambda: self.clear_requested.emit(self.view_name.lower()))
+        self.btn_clear.clicked.connect(lambda: self.clear_requested.emit(self.view_id))
 
     def _cursor_inside(self) -> bool:
         return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
@@ -738,7 +741,7 @@ class VideoView(QFrame):
         if hovered == self._hovered:
             return
         self._hovered = hovered
-        self.hover_changed.emit(self.view_name.lower(), hovered)
+        self.hover_changed.emit(self.view_id, hovered)
 
     def enterEvent(self, event: QEnterEvent) -> None:  # noqa: N802 - Qt override
         self._set_hovered(True)
@@ -772,9 +775,7 @@ class VideoView(QFrame):
         if active == self._drag_source_active:
             return
         self._drag_source_active = active
-        self.setProperty("dragSource", "true" if active else "")
-        self.style().unpolish(self)
-        self.style().polish(self)
+        set_style_property(self, "dragSource", "true" if active else "")
 
     def _on_zoom_changed(self, zoom: float) -> None:
         """Show the zoom factor.
@@ -807,6 +808,11 @@ class VideoView(QFrame):
         )
 
     @property
+    def view_id(self) -> ViewId:
+        """Lowercase view identity used by sync, layout and drag signals."""
+        return cast(ViewId, self.view_name.lower())
+
+    @property
     def player(self) -> PlayerController:
         """The embedded player; raises if ensure_player() was never called."""
         return self.surface.player
@@ -822,11 +828,11 @@ class VideoView(QFrame):
         self._stack.setCurrentWidget(self.surface)
         self.btn_clear.setVisible(True)
         if self._hovered:  # pointer stayed on the pane across clear/reload
-            self.hover_changed.emit(self.view_name.lower(), True)
+            self.hover_changed.emit(self.view_id, True)
 
     @property
-    def has_video(self) -> bool:
-        """Whether this pane currently shows the video surface."""
+    def shows_surface(self) -> bool:
+        """Whether this pane currently displays the video surface."""
         return self._stack.currentWidget() is self.surface
 
     def clear_loaded(self) -> None:
@@ -867,15 +873,13 @@ class VideoView(QFrame):
         if zone == self._drop_zone_name:
             return
         self._drop_zone_name = zone
-        self.setProperty("dropZone", zone or "")
-        self.style().unpolish(self)
-        self.style().polish(self)
+        set_style_property(self, "dropZone", zone or "")
         self.update()
         # The host draws the insertion line in the gap between panes.
         notify = getattr(self.parentWidget(), "set_drop_indicator", None)
         if callable(notify):
             notify(self, zone)
-        self.drop_zone_changed.emit(self.view_name.lower(), zone or "")
+        self.drop_zone_changed.emit(self.view_id, zone or "")
 
     def _drop_zone(self, pos: QPoint) -> str:
         # Dropping on another pane's header is the most natural gesture:
@@ -893,7 +897,7 @@ class VideoView(QFrame):
         """Accept pane drags and video-file drops."""
         source = self._drag_source(event)
         if source is not None:
-            if source != self.view_name.lower():
+            if source != self.view_id:
                 event.acceptProposedAction()
             return
         if first_video_path(event.mimeData()) is not None:
@@ -909,7 +913,7 @@ class VideoView(QFrame):
 
     def pane_drag_move(self, pos: QPoint, source: str) -> None:
         """Highlight the drop zone for an internal pane drag."""
-        if source == self.view_name.lower():
+        if source == self.view_id:
             self.set_drop_zone(None)
             return
         self.set_drop_zone(self._drop_zone(pos))
@@ -918,8 +922,8 @@ class VideoView(QFrame):
         """Commit an internal pane drop at the given position."""
         zone = self._drop_zone(pos)
         self.set_drop_zone(None)
-        if source != self.view_name.lower():
-            self.view_dropped_on.emit(source, self.view_name.lower(), zone)
+        if source != self.view_id:
+            self.view_dropped_on.emit(source, self.view_id, zone)
 
     def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
         self.set_drop_zone(None)
