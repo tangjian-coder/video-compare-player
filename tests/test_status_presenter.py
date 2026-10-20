@@ -30,6 +30,13 @@ def test_status_two_offsets_lists_pairs() -> None:
     assert readout.tooltip == ""
 
 
+def test_status_uses_promoted_master_label() -> None:
+    readout = format_live_status(1.0, {"a": 0.04, "c": -0.12}, {"a": 0.0, "c": 0.0012}, 60.0, "b")
+    assert readout.text.startswith("B    1.000s")
+    assert "BA +0.040s" in readout.text
+    assert "BC -0.120s" in readout.text
+
+
 def test_status_three_offsets_uses_summary_and_tooltip() -> None:
     offsets = {"b": 0.04, "c": -0.12, "d": 0.2}
     drifts = {"b": 0.0, "c": 0.0012, "d": -0.003}

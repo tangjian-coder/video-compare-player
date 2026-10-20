@@ -22,6 +22,38 @@ class SyncSession:
         self.master: ViewId = "a"
         self.engines: dict[ViewId, SyncEngine] = {}
 
+    def add_follower(self, view: ViewId) -> None:
+        """Create the engine for one newly added follower view."""
+        views = self._views()
+        master = views.get(self.master)
+        pane = views.get(view)
+        if master is None or pane is None:
+            return
+        if not master.surface.has_player or not pane.surface.has_player:
+            return
+        self.engines[view] = SyncEngine(master.player, pane.player)
+
+    def rebuild(self) -> None:
+        """Recreate every follower engine against the current master."""
+        self.engines.clear()
+        views = self._views()
+        master = views.get(self.master)
+        if master is None or not master.surface.has_player:
+            return
+        for vid, pane in views.items():
+            if vid == self.master or not pane.surface.has_player:
+                continue
+            self.engines[vid] = SyncEngine(master.player, pane.player)
+
+    def set_master(self, master: ViewId) -> None:
+        """Switch the reference view and rebuild all follower engines."""
+        self.master = master
+        self.rebuild()
+
+    def remove_view(self, view: ViewId) -> None:
+        """Drop a removed view's engine."""
+        self.engines.pop(view, None)
+
     @property
     def master_player(self) -> PlayerController:
         return self._views()[self.master].player

@@ -27,9 +27,10 @@ class FakePlayer:
 
 def make_session() -> tuple[SyncSession, FakePlayer, FakePlayer]:
     a, b = FakePlayer(), FakePlayer()
+    surface = SimpleNamespace(has_player=True)
     views = {
-        "a": SimpleNamespace(player=a),
-        "b": SimpleNamespace(player=b),
+        "a": SimpleNamespace(player=a, surface=surface),
+        "b": SimpleNamespace(player=b, surface=surface),
     }
     session = SyncSession(lambda: views)  # type: ignore[arg-type]
     session.engines["b"] = SyncEngine(a, b)  # type: ignore[arg-type]
@@ -51,6 +52,21 @@ def test_invalidate_master_clears_every_pair() -> None:
     session.engines["b"].state.point_b = 2.0
     assert session.invalidate("a") == ["b"]
     assert session.current_offsets() == {}
+
+
+def test_set_master_rebuilds_engines_around_new_reference() -> None:
+    session, a, b = make_session()
+    session.set_master("b")
+    assert session.master == "b"
+    assert set(session.engines) == {"a"}
+    engine = session.engines["a"]
+    assert engine.a is b and engine.b is a
+
+
+def test_remove_view_drops_its_engine() -> None:
+    session, _a, _b = make_session()
+    session.remove_view("b")
+    assert session.engines == {}
 
 
 def test_seek_master_all_seeks_master_and_followers() -> None:

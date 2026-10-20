@@ -5,8 +5,9 @@ is required for the sync-point workflow: step each view independently to the
 same physical moment, then mark all sync points at once.
 
 Views are added (＋ / V) and removed (－) dynamically, 2 minimum, 4 maximum.
-View A is the master timeline; every other view gets its own SyncEngine
-against A, so offsets and drift are tracked per follower pair.
+View A is the default reference timeline; clearing it promotes the next
+loaded view. Every other view gets its own SyncEngine against the current
+reference, so offsets and drift are tracked per follower pair.
 """
 
 from __future__ import annotations
@@ -136,6 +137,10 @@ class MainWindow(QMainWindow):
             action = open_menu.addAction(f"Open {vid.upper()}…")
             action.triggered.connect(lambda _=False, v=vid: self._open_dialog(v))
             self._open_actions[vid] = action
+        open_menu.addSeparator()
+        self._clear_all_action = open_menu.addAction("Clear all videos")
+        self._clear_all_action.setIcon(make_icon("x", "#a1a1a6"))
+        self._clear_all_action.triggered.connect(self._clear_all_videos)
         self.btn_open.setMenu(open_menu)
 
         self.btn_layout = QToolButton()
@@ -164,11 +169,11 @@ class MainWindow(QMainWindow):
         self.sync_chip = QLabel("● not synced")
         self.sync_chip.setObjectName("syncChip")
         self.sync_chip.setProperty("state", "off")
-        self.btn_sync_clear = QPushButton("Clear")
+        self.btn_sync_clear = QPushButton("Unsync")
         self.btn_sync_clear.setObjectName("syncButton")
         self.btn_sync_clear.setIcon(make_icon("x", "#a1a1a6"))
         self.btn_sync_clear.setIconSize(QSize(14, 14))
-        self.btn_sync_clear.setToolTip("Clear all sync points (R)")
+        self.btn_sync_clear.setToolTip("Clear all sync points, keeping the videos (R)")
         self.btn_rec = QPushButton("Rec")
         self.btn_rec.setObjectName("recButton")
         self.btn_rec.setIcon(make_icon("record", "#ff453a"))
@@ -303,9 +308,7 @@ class MainWindow(QMainWindow):
         try:
             self.views["a"].ensure_player()
             self.views["b"].ensure_player()
-            self.engines["b"] = SyncEngine(
-                self.views[self._sync.master].player, self.views["b"].player
-            )
+            self._sync.rebuild()
         except (RuntimeError, PlayerError) as exc:
             QMessageBox.critical(self, "mpv error", str(exc))
             self.close()  # never leave a dead, unresponsive window on screen
@@ -393,6 +396,7 @@ class MainWindow(QMainWindow):
         view.drop_zone_changed.connect(self._on_drop_zone_changed)
         view.hover_changed.connect(self._on_view_hover_changed)
         view.context_menu_requested.connect(self._on_view_context_menu)
+        view.clear_requested.connect(self._clear_view_video)
         view.btn_step_back.clicked.connect(lambda checked=False, v=view_id: self._step_view(v, -1))
         view.btn_step_fwd.clicked.connect(lambda checked=False, v=view_id: self._step_view(v, 1))
         view.btn_play.clicked.connect(lambda checked=False, v=view_id: self._toggle_play_view(v))
@@ -537,7 +541,7 @@ class MainWindow(QMainWindow):
             self.view_host.apply_layout(self._layout)
             view.set_drag_enabled(not self._recording())
             view.ensure_player()
-            self.engines[vid] = SyncEngine(self.views[self._sync.master].player, view.player)
+            self._sync.add_follower(vid)
             self._wire_view(view, vid)
             self._connect_gestures(view)
             view.player.set_speed(self.config.speed)
@@ -572,11 +576,19 @@ class MainWindow(QMainWindow):
         self._stop_playback()
         prior_ids = list(self.view_ids)
         vid = self.view_ids[-1]
+        removed_master = vid == self._sync.master
+        new_master: ViewId | None = None
+        if removed_master:
+            new_master = self._reference_candidate(vid) or next(
+                other for other in prior_ids if other != vid
+            )
         self._layout = pane_layout.remove_view(
             self._layout, vid, prior_ids, customized=self._layout_customized
         )
         self._apply_view_size_policy()
         self._destroy_view(vid)
+        if removed_master and new_master is not None:
+            self._set_reference(new_master)
         self.view_host.apply_layout(self._layout)
         self._refresh_view_buttons()
         self._set_active_view(self._active_view)
@@ -607,7 +619,7 @@ class MainWindow(QMainWindow):
     def _destroy_view(self, vid: ViewId) -> None:
         """Remove a view from state and life (player released)."""
         view = self._view_set.pop(vid)
-        self.engines.pop(vid, None)
+        self._sync.remove_view(vid)
         self._load_pending.pop(vid, None)
         if view is not None:
             with contextlib.suppress(RuntimeError):
@@ -767,8 +779,142 @@ class MainWindow(QMainWindow):
             action.setEnabled(vid in self.views and can_open)
         self.btn_add.setEnabled(len(self.view_ids) < MAX_VIEWS)
         self.btn_remove.setEnabled(len(self.view_ids) > MIN_VIEWS)
+        self._clear_all_action.setEnabled(can_open)
+        for view in self.views.values():
+            view.btn_clear.setEnabled(can_open)
 
-    # -- loading ------------------------------------------------------------------
+    # -- loading / clearing -------------------------------------------------------
+
+    def _video_loaded(self, vid: ViewId) -> bool:
+        """Whether this view shows a video (or has a load in flight).
+
+        The UI state is authoritative: mpv can report no duration while a
+        pane still displays the previous file (reload/failed reload), which
+        used to make Clear a silent no-op.
+        """
+        if vid in self._load_pending:
+            return True
+        view = self.views.get(vid)
+        if view is None:
+            return False
+        return view.has_video or (view.surface.has_player and view.player.duration is not None)
+
+    def _reference_candidate(self, exclude: ViewId | None = None) -> ViewId | None:
+        """First remaining loaded view, preferring panes already showing video."""
+        remaining = [vid for vid in self.view_ids if vid != exclude]
+        visible = [vid for vid in remaining if self.views[vid].has_video]
+        pending = [vid for vid in remaining if self._video_loaded(vid)]
+        candidates = visible or pending
+        return candidates[0] if candidates else None
+
+    def _reset_speeds(self) -> None:
+        """Undo any regulate nudge after engines/sync are rebuilt."""
+        for vid in self.view_ids:
+            pane = self.views[vid]
+            if pane.surface.has_player:
+                pane.player.set_speed(self.config.speed)
+
+    def _set_reference(self, vid: ViewId) -> None:
+        """Switch reference, rebuild engines, reset nudges, refresh UI."""
+        self._sync.set_master(vid)
+        self._reset_speeds()
+        self._refresh_sync_ui()
+
+    def _ensure_reference(self) -> None:
+        """Promote a loaded view when the current reference has no video."""
+        master = self.views.get(self._sync.master)
+        if master is not None and master.has_video:
+            return
+        if self._sync.master in self._load_pending:
+            return  # wait for the in-flight load before switching again
+        candidate = self._reference_candidate(self._sync.master)
+        if candidate is None:
+            if master is None and self.view_ids:
+                self._set_reference(self.view_ids[0])
+            return
+        self._set_reference(candidate)
+        logger.info("reference promoted to view %s", candidate)
+        self.statusBar().showMessage(f"{candidate.upper()} is now the reference")
+
+    def _clear_view_video(self, view: str) -> None:
+        """Unload one pane's video and return it to the empty placeholder."""
+        if self._closing or not self._initialized:
+            return
+        vid = cast(ViewId, view.lower())
+        if vid not in self.views or not self._video_loaded(vid):
+            return
+        if self._recording():
+            self.statusBar().showMessage("Stop recording before clearing videos")
+            return
+        # Clearing the reference view promotes the first remaining loaded
+        # view: the transport needs a master player and old anchors are void.
+        new_master = self._reference_candidate(vid) if vid == self._sync.master else None
+        self._stop_playback()
+        self._load_pending.pop(vid, None)
+        pane = self.views[vid]
+        try:
+            pane.player.unload()
+        except Exception:  # mpv must not leave the pane visually loaded
+            logger.warning("view %s unload failed", vid, exc_info=True)
+        finally:
+            pane.clear_loaded()
+        if new_master is not None:
+            self._set_reference(new_master)
+        else:
+            self._invalidate_sync(vid)
+        self._push_timeline_durations()
+        self._reset_hover()
+        self._refresh_sync_ui()
+        logger.info("view %s cleared", vid)
+        if new_master is not None:
+            self.statusBar().showMessage(
+                f"View {vid.upper()} cleared — {new_master.upper()} is now the reference"
+            )
+        else:
+            self.statusBar().showMessage(f"View {vid.upper()} cleared")
+
+    def _clear_all_videos(self) -> None:
+        """Unload every video, clear sync, and keep the pane layout."""
+        if self._closing or not self._initialized:
+            return
+        if self._recording():
+            self.statusBar().showMessage("Stop recording before clearing videos")
+            return
+        if not any(self._video_loaded(vid) for vid in self.view_ids):
+            self.statusBar().showMessage("No videos to clear")
+            return
+        self._stop_playback()
+        self._load_pending.clear()
+        for vid in self.view_ids:
+            pane = self.views[vid]
+            try:
+                if pane.surface.has_player:
+                    pane.player.unload()
+            except Exception:
+                logger.warning("view %s unload failed", vid, exc_info=True)
+            finally:
+                pane.clear_loaded()
+        self._set_reference("a")
+        self._push_timeline_durations()
+        self._reset_hover()
+        self._refresh_sync_ui()
+        logger.info("all videos cleared")
+        self.statusBar().showMessage("All videos cleared")
+
+    def _push_timeline_durations(self) -> None:
+        """Send each view's duration to the timeline when it changes."""
+        durs: dict[ViewId, float | None] = {}
+        for vid in self.view_ids:
+            pane = self.views[vid]
+            # A cleared pane must stay dead even if mpv's stop command failed
+            # and the duration property is still stale.
+            if vid in self._load_pending or pane.has_video:
+                durs[vid] = pane.player.duration
+            else:
+                durs[vid] = None
+        if durs != self._timeline_durs:
+            self._timeline_durs = durs
+            self.timeline.set_durations(durs)
 
     def open_video(self, view: ViewId, path: Path) -> None:
         """Load a video into one of the views."""
@@ -827,10 +973,8 @@ class MainWindow(QMainWindow):
         # Push per-view durations without waiting for engine readiness:
         # with only one side loaded the other renders as a dead track, and
         # the loaded side already shows its real extent.
-        durs = {vid: self.views[vid].player.duration for vid in self.view_ids}
-        if durs != self._timeline_durs:
-            self._timeline_durs = durs
-            self.timeline.set_durations(durs)
+        self._push_timeline_durations()
+        self._ensure_reference()
 
     def _on_view_loaded(self, view_id: ViewId, path: Path) -> None:
         """Loaded-view bookkeeping: join a running synced playback if able."""
@@ -1063,6 +1207,7 @@ class MainWindow(QMainWindow):
     def _refresh_sync_ui(self) -> None:
         """Push the current sync state to the timeline and the chip."""
         offsets = self._current_offsets()
+        self.timeline.set_master(self._sync.master)
         self.timeline.set_anchors(self._current_anchors())
         self.timeline.set_offsets(offsets)
         self._set_sync_chip(offsets)
@@ -1082,7 +1227,8 @@ class MainWindow(QMainWindow):
         if rng is not None and master is not None:
             self._seek_master_all(min(max(master, rng[0]), rng[1]))
         self._refresh_sync_ui()
-        parts = [f"A{vid.upper()} {off:+.3f}s" for vid, off in offsets.items()]
+        label = self._sync.master.upper()
+        parts = [f"{label}{vid.upper()} {off:+.3f}s" for vid, off in offsets.items()]
         self.statusBar().showMessage("Synced: " + " · ".join(parts))
 
     def _set_sync_chip(self, offsets: dict[ViewId, float]) -> None:
@@ -1095,7 +1241,10 @@ class MainWindow(QMainWindow):
                 (off,) = offsets.values()
                 self.sync_chip.setText(f"● {off:+.3f}s")
             else:
-                inner = " · ".join(f"A{vid.upper()} {off:+.3f}" for vid, off in offsets.items())
+                label = self._sync.master.upper()
+                inner = " · ".join(
+                    f"{label}{vid.upper()} {off:+.3f}" for vid, off in offsets.items()
+                )
                 self.sync_chip.setText(f"● {inner}")
             self.sync_chip.setProperty("state", "on")
         # Force QSS re-evaluation after a dynamic property change.
@@ -1110,8 +1259,7 @@ class MainWindow(QMainWindow):
         # Undo any ±10% regulate nudge: without an anchor the loop stops
         # correcting, so a nudged follower would otherwise keep that speed.
         for vid in self.view_ids:
-            if vid != self._sync.master:
-                self.views[vid].player.set_speed(self.config.speed)
+            self.views[vid].player.set_speed(self.config.speed)
         self._refresh_sync_ui()
         self.statusBar().showMessage("Sync cleared")
 
@@ -1209,6 +1357,8 @@ class MainWindow(QMainWindow):
             if secs != self._rec_secs:
                 self._rec_secs = secs
                 self.btn_rec.setText(f"⏺ {secs // 60}:{secs % 60:02d}")
+        if self._sync.master not in self.views:
+            self._set_reference(self.view_ids[0])
         master_player = self.views[self._sync.master].player
         master = master_player.time_pos
         shown: float | None = None
@@ -1240,7 +1390,7 @@ class MainWindow(QMainWindow):
                 t = p.time_pos
             if t is None and shown is not None:
                 eng = self.engines.get(vid)
-                t = eng.view_time(vid, shown) if eng is not None else shown
+                t = eng.view_time(vid, shown, self._sync.master) if eng is not None else shown
             if t is None:
                 continue
             dur = p.duration
@@ -1259,11 +1409,12 @@ class MainWindow(QMainWindow):
                 self._current_offsets(),
                 {vid: eng.drift() for vid, eng in self.engines.items() if eng.ready},
                 self._reference_fps(),
+                self._sync.master,
             )
             self._status_live.setText(readout.text)
             self._status_live.setToolTip(readout.tooltip)
         else:
-            self._status_live.setText("A not loaded")
+            self._status_live.setText(f"{self._sync.master.upper()} not loaded")
         self._set_play_icon(self._playing)
 
     @staticmethod

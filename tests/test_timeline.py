@@ -1,6 +1,11 @@
 """Tests for the multi-track timeline's coordinate mapping and state."""
 
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # before QApplication
+
 import pytest
+from PySide6.QtWidgets import QApplication
 
 from vcplayer.ui.timeline import (
     TRACK_H,
@@ -32,6 +37,11 @@ def test_follower_tracks_c_and_d_subtract_offset() -> None:
     assert track_x_to_master(50.0, 100.0, 40.0, "d", -0.5) == pytest.approx(20.5)
 
 
+def test_reference_track_moves_with_master_switch() -> None:
+    assert track_x_to_master(50.0, 100.0, 40.0, "b", 2.0, "b") == pytest.approx(20.0)
+    assert track_x_to_master(50.0, 100.0, 40.0, "a", 2.0, "b") == pytest.approx(18.0)
+
+
 def test_x_clamped_to_track_width() -> None:
     assert track_x_to_master(150.0, 100.0, 40.0, "a", 0.0) == pytest.approx(40.0)
     assert track_x_to_master(-10.0, 100.0, 40.0, "a", 0.0) == pytest.approx(0.0)
@@ -55,15 +65,18 @@ def test_height_scales_with_track_count() -> None:
 # -- widget state ---------------------------------------------------------------
 
 
+@pytest.fixture(scope="module")
+def qapp() -> QApplication:
+    return QApplication.instance() or QApplication([])
+
+
 @pytest.fixture
-def widget(monkeypatch: pytest.MonkeyPatch) -> TimelineWidget:
+def widget(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> TimelineWidget:
     """A TimelineWidget without Qt paint/resize side effects."""
     monkeypatch.setattr(TimelineWidget, "update", lambda self: None)
     monkeypatch.setattr(TimelineWidget, "setMinimumHeight", lambda self, h: None)
     monkeypatch.setattr(TimelineWidget, "width", lambda self: 100)
-    w = TimelineWidget.__new__(TimelineWidget)
-    w._init_state()
-    return w
+    return TimelineWidget()
 
 
 def test_offset_comes_from_set_offsets(widget: TimelineWidget) -> None:
@@ -84,6 +97,21 @@ def test_set_offsets_ignores_master_entry(widget: TimelineWidget) -> None:
     widget.set_offsets({"a": 9.0, "b": 1.0})
     assert widget._offset("a") == 0.0
     assert widget._offset("b") == pytest.approx(1.0)
+    widget.set_master("b")
+    widget.set_offsets({"a": 2.0, "b": 9.0})
+    assert widget._offset("b") == 0.0
+    assert widget._offset("a") == pytest.approx(2.0)
+
+
+def test_scrub_map_uses_promoted_reference(widget: TimelineWidget) -> None:
+    widget.set_tracks(["a", "b", "c"])
+    widget.set_durations({"a": 40.0, "b": 40.0, "c": 40.0})
+    widget.set_master("b")
+    widget.set_offsets({"a": 2.0, "c": -1.0})
+    master = 24.0 / 62.0 * 40.0
+    assert widget._x_to_master(50.0, "b") == pytest.approx(master)
+    assert widget._x_to_master(50.0, "a") == pytest.approx(master - 2.0)
+    assert widget._x_to_master(50.0, "c") == pytest.approx(master + 1.0)
 
 
 def test_set_tracks_clears_offsets_of_dropped_views(widget: TimelineWidget) -> None:
@@ -155,9 +183,30 @@ def test_scrub_map_uses_per_view_offset(widget: TimelineWidget) -> None:
 
 def test_hover_at_only_hits_track_rows(widget: TimelineWidget) -> None:
     widget.set_tracks(["a", "b"])
+    widget.set_durations({"a": 10.0, "b": 10.0})
     first = TRACK_TOP_Y + TRACK_H / 2
     second = first + TRACK_PITCH
     assert widget._hover_at(first) == "a"
     assert widget._hover_at(second) == "b"
     assert widget._hover_at(1.0) is None
     assert widget._hover_at(1000.0) is None
+
+
+def test_hover_ignores_unloaded_tracks(widget: TimelineWidget) -> None:
+    widget.set_tracks(["a", "b", "c"])
+    widget.set_durations({"a": 10.0, "b": 10.0})
+    third = TRACK_TOP_Y + 2 * TRACK_PITCH + TRACK_H / 2
+    assert widget._hover_at(third) is None
+    widget.set_hovered_view("c")
+    assert widget.hovered_view_id is None
+
+
+def test_hover_clears_when_track_becomes_unloaded(widget: TimelineWidget) -> None:
+    widget.set_tracks(["a", "b"])
+    widget.set_durations({"a": 10.0, "b": 10.0})
+    seen: list[str | None] = []
+    widget.hovered_view.connect(seen.append)
+    widget.set_hovered_view("b")
+    widget.set_durations({"b": None})
+    assert widget.hovered_view_id is None
+    assert seen == [None]

@@ -205,6 +205,7 @@ def test_view_time_mapping() -> None:
     eng, _, _ = make_engine(offset_a=2.0, offset_b=5.0)
     assert eng.view_time("a", 1.0) == 1.0
     assert eng.view_time("b", 1.0) == pytest.approx(4.0)
+    assert eng.view_time("a", 1.0, "b") == pytest.approx(4.0)
 
 
 def test_step_advances_one_reference_frame() -> None:

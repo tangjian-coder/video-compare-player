@@ -1,6 +1,7 @@
 """Sync engine: aligns two player timelines.
 
-Master time is view A's timeline. View B is shifted by the sync offset:
+Master time is the reference view's timeline. The follower is shifted by
+the sync offset:
     t_b = t_a + offset,  offset = sync_point_b - sync_point_a
 
 Qt-free and unit-testable; depends on players only through the PlayerLike
@@ -79,7 +80,7 @@ class SyncEngine:
 
         One-shot replacement for the old two-step point-by-point workflow.
         Reads both times before touching the state: a failed read must not
-        leave a half-updated (new A + old B) "complete" sync behind.
+        leave a half-updated (new reference + old follower) "complete" sync.
         Returns the resulting offset.
         """
         point_a = self._require_time(self.a)
@@ -116,12 +117,12 @@ class SyncEngine:
 
     @property
     def reference_fps(self) -> float:
-        """Frame rate of the reference view (A); fallback 25 fps."""
+        """Frame rate of the reference view; fallback 25 fps."""
         fps = self.a.fps
         return fps if fps and fps > 0 else 25.0
 
     def master_time(self) -> float:
-        """Current master position (view A's timeline)."""
+        """Current master position (the reference view's timeline)."""
         return self._require_time(self.a)
 
     def master_range(self) -> tuple[float, float]:
@@ -132,9 +133,9 @@ class SyncEngine:
         hi = min(dur_a, dur_b - self.offset)
         return lo, max(lo, hi)
 
-    def view_time(self, view: ViewId, master: float) -> float:
+    def view_time(self, view: ViewId, master: float, master_view: ViewId = "a") -> float:
         """Map a master position to a view-local time."""
-        return master if view == "a" else master + self.offset
+        return master if view == master_view else master + self.offset
 
     def seek_master(self, master: float, *, exact: bool = True) -> float:
         """Seek both views to a master position; returns the clamped position.
@@ -154,7 +155,7 @@ class SyncEngine:
     def seek_follower(self, master: float, *, exact: bool = True) -> None:
         """Seek only the follower to the aligned position of `master`.
 
-        The multi-view window seeks A once and calls this for every ready
+        The multi-view window seeks the reference once and calls this for every ready
         follower, avoiding N redundant seeks of the shared master player.
         """
         target = master + self.offset
@@ -169,7 +170,7 @@ class SyncEngine:
     def force_resync(self) -> None:
         """Hard-align B onto A's aligned time right now (startup stabilizer).
 
-        B's target is clamped to its own stream: when A sits outside the
+        The follower's target is clamped to its own stream: when the reference sits outside the
         common range a perfectly aligned B position may not exist, and an
         explicit clamp (unlike mpv's silent one) keeps the seek deliberate.
         """
@@ -187,7 +188,7 @@ class SyncEngine:
         Returns True when a corrective seek was issued. An unconditional
         seek restarts B's decode pipeline (keyframe backstep plus decode
         forward), stalling B for hundreds of ms on long-GOP sources while
-        A already plays — so seek only when meaningfully misaligned and
+        the reference already plays — so seek only when meaningfully misaligned and
         leave sub-frame residuals to regulate()'s speed loop.
         """
         drift = self.drift()
@@ -205,7 +206,7 @@ class SyncEngine:
     # -- drift handling ---------------------------------------------------------
 
     def drift(self) -> float | None:
-        """Signed drift in seconds; positive means A is ahead of B."""
+        """Signed drift in seconds; positive means reference is ahead."""
         t_a, t_b = self.a.time_pos, self.b.time_pos
         if t_a is None or t_b is None:
             return None
@@ -226,7 +227,7 @@ class SyncEngine:
         raw = self.drift()
         if raw is None:
             return None
-        # Follower at EOF: the growing drift is A advancing, not a desync
+        # Follower at EOF: the growing drift is the reference advancing, not a desync
         # the speed loop could correct. Freeze the EWMA too, or the huge
         # accumulated value would overshoot right after a rewind.
         dur_b, t_b = self.b.duration, self.b.time_pos

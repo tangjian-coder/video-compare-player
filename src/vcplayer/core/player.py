@@ -262,6 +262,21 @@ class PlayerController:
             self._last_cross_dims = None
             self.set_crosshair(True)
 
+    def unload(self) -> None:
+        """Stop and unload the current file, keeping the mpv core alive."""
+        if self._terminated:
+            return
+        self._meta = None
+        try:
+            self._mpv.command("stop")
+        except SystemError as exc:  # mpv wraps command failures in SystemError
+            logger.warning("failed to unload video: %s", exc)
+        try:
+            self.reset_view()
+        except Exception as exc:  # a dead/busy core must not block the UI reset
+            logger.warning("failed to reset unloaded player: %s", exc)
+        self._last_cross_dims = None
+
     def play(self) -> None:
         """Resume playback."""
         if not self._terminated:

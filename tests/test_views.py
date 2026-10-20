@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QMouseEvent, QPointingDevice
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from vcplayer.config import AppConfig
@@ -23,7 +24,7 @@ from vcplayer.core.player import PlayerError
 from vcplayer.core.sync import SyncEngine
 from vcplayer.ui import layout as pane_layout
 from vcplayer.ui.main_window import MainWindow
-from vcplayer.ui.timeline import TimelineWidget
+from vcplayer.ui.timeline import TRACK_H, TRACK_PITCH, TRACK_TOP_Y, TimelineWidget
 from vcplayer.ui.video_view import VideoView
 
 
@@ -42,6 +43,7 @@ class FakePlayer:
         self.fast_seeks: list[float] = []
         self.speeds: list[float] = []
         self.plays = 0
+        self.unloads = 0
 
     def play(self) -> None:
         self.plays += 1
@@ -51,6 +53,13 @@ class FakePlayer:
         self.is_playing = False
 
     def terminate(self) -> None: ...
+
+    def unload(self) -> None:
+        self.unloads += 1
+        self.duration = None
+        self.meta = None
+        self.time_pos = None
+        self.is_playing = False
 
     def set_speed(self, speed: float) -> None:
         self.speeds.append(speed)
@@ -409,6 +418,7 @@ def test_track_hover_sets_pane_property(qapp: QApplication) -> None:
 
 def test_view_hover_drives_timeline(qapp: QApplication) -> None:
     w = make_window(qapp, n=3)
+    w.timeline.set_durations({"a": 10.0, "b": 10.0, "c": 10.0})
     w._on_view_hover_changed("b", True)
     assert w.timeline.hovered_view_id == "b"
     w._on_view_hover_changed("b", False)
@@ -478,6 +488,7 @@ def test_recording_blocks_open_hover_and_open_actions(qapp: QApplication) -> Non
 
 def test_timeline_tracks_and_hover_reset_on_remove(qapp: QApplication) -> None:
     w = make_window(qapp, n=3)
+    w.timeline.set_durations({"c": 10.0})
     w.timeline.set_hovered_view("c")
     w._on_track_hovered("c")
     w._remove_last_view()
@@ -505,6 +516,7 @@ def test_timeline_mouse_tracking_and_key_filtering(qapp: QApplication) -> None:
 def test_timeline_move_event_drives_hover(qapp: QApplication) -> None:
     t = TimelineWidget()
     t.set_tracks(["a", "b"])
+    t.set_durations({"a": 10.0, "b": 10.0})
     seen: list[str | None] = []
     t.hovered_view.connect(seen.append)
     y = 20.0  # inside the first track row
@@ -522,6 +534,227 @@ def test_timeline_move_event_drives_hover(qapp: QApplication) -> None:
     assert seen and seen[-1] in ("a", "b")
     t.leaveEvent(QEvent(QEvent.Type.Leave))
     assert seen[-1] is None
+
+
+def test_unloaded_timeline_track_is_inert(qapp: QApplication) -> None:
+    t = TimelineWidget()
+    t.set_tracks(["a", "b", "c"])
+    t.set_durations({"a": 10.0, "b": 10.0})
+    seen: list[float] = []
+    t.scrub_preview.connect(seen.append)
+    t.seek_committed.connect(seen.append)
+    y = TRACK_TOP_Y + 2 * TRACK_PITCH + TRACK_H / 2
+    event = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        QPointF(100.0, y),
+        QPointF(100.0, y),
+        QPointF(100.0, y),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        QPointingDevice.primaryPointingDevice(),
+    )
+    t.mousePressEvent(event)
+    assert t._drag_view is None
+    assert seen == []
+
+
+def test_empty_pane_hover_does_not_light_track_or_pane(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    w.timeline.hovered_view.connect(w._on_track_hovered)
+    w.timeline.set_durations({"a": 10.0, "b": 10.0})
+    w.timeline._set_hover("b")
+    assert w.views["b"].property("trackHover") == "true"
+    w._on_view_hover_changed("c", True)
+    assert w.timeline.hovered_view_id is None
+    assert w.views["b"].property("trackHover") == ""
+    w.timeline._set_hover("c")
+    assert w.timeline.hovered_view_id is None
+    assert w.views["c"].property("trackHover") == ""
+
+
+def test_unloading_track_clears_track_and_pane_hover(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    w.timeline.hovered_view.connect(w._on_track_hovered)
+    w.timeline.set_durations({"a": 10.0, "b": 10.0, "c": 10.0})
+    w.timeline._set_hover("c")
+    assert w.timeline.hovered_view_id == "c"
+    assert w.views["c"].property("trackHover") == "true"
+    w.timeline.set_durations({"c": None})
+    assert w.timeline.hovered_view_id is None
+    assert w.views["c"].property("trackHover") == ""
+
+
+def test_clear_button_visibility_and_signal(qapp: QApplication) -> None:
+    view = VideoView("C")
+    seen: list[str] = []
+    view.clear_requested.connect(seen.append)
+    assert view.btn_clear.isHidden()
+    assert not view.has_video
+    view.set_loaded_name("c.mp4")
+    assert view.has_video
+    assert not view.btn_clear.isHidden()
+    view.set_time_text("1.000s")
+    view._zoom_label.setText("×2.0")
+    view._rotation_label.setText("90°")
+    view.btn_clear.click()
+    assert seen == ["c"]
+    view.clear_loaded()
+    assert view.btn_clear.isHidden()
+    assert not view.has_video
+    assert view._caption.text() == "no video"
+    assert view._time_label.text() == "--"
+    assert view._zoom_label.text() == "×1.0"
+    assert view._rotation_label.text() == ""
+    assert view._stack.currentWidget() is view._placeholder
+
+
+def test_clear_button_accepts_real_mouse_click(qapp: QApplication) -> None:
+    view = VideoView("C")
+    seen: list[str] = []
+    view.clear_requested.connect(seen.append)
+    view.set_loaded_name("c.mp4")
+    view.show()
+    QTest.mouseClick(view.btn_clear, Qt.MouseButton.LeftButton)
+    assert seen == ["c"]
+    view.close()
+
+
+def test_main_window_clear_button_click_unloads(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    w._wire_view(w.views["c"], "c")
+    p = _players(w)
+    p["c"].duration = 10.0
+    w.views["c"].set_loaded_name("c.mp4")
+    QTest.mouseClick(w.views["c"].btn_clear, Qt.MouseButton.LeftButton)
+    assert p["c"].unloads == 1
+    assert w.views["c"]._caption.text() == "no video"
+
+
+def test_clear_one_view_unloads_and_resets(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    p = _players(w)
+    for player in p.values():
+        player.duration = 10.0
+    for view in w.views.values():
+        view.set_loaded_name("video.mp4")
+    w.timeline.set_durations({vid: 10.0 for vid in w.view_ids})
+    w._clear_view_video("c")
+    assert p["c"].unloads == 1
+    assert p["c"].duration is None
+    assert w.views["c"]._caption.text() == "no video"
+    assert w.timeline._dur["a"] == 10.0
+    assert w.timeline._dur["c"] is None
+    assert "cleared" in w.statusBar().currentMessage()
+
+
+def test_clearing_master_promotes_first_loaded_follower(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    p = _players(w)
+    for player in p.values():
+        player.duration = 10.0
+    w._clear_view_video("a")
+    assert p["a"].unloads == 1
+    assert w._sync.master == "b"
+    assert "b" not in w.engines
+    assert w.engines.keys() == {"a", "c"}
+    assert "reference" in w.statusBar().currentMessage()
+
+
+def test_clear_works_when_duration_is_missing_but_pane_shows_video(
+    qapp: QApplication,
+) -> None:
+    w = make_window(qapp, n=3)
+    p = _players(w)
+    p["c"].duration = None
+    w.views["c"].set_loaded_name("c.mp4")
+    w._clear_view_video("c")
+    assert p["c"].unloads == 1
+    assert w.views["c"]._caption.text() == "no video"
+
+
+def test_recording_blocks_clearing_videos(qapp: QApplication) -> None:
+    class FakeRecorder:
+        recording = True
+
+    w = make_window(qapp, n=2)
+    w._rec_controller._recorder = FakeRecorder()  # type: ignore[assignment]
+    w._refresh_view_buttons()
+    p = _players(w)
+    p["a"].duration = 10.0
+    assert not w._clear_all_action.isEnabled()
+    assert all(not view.btn_clear.isEnabled() for view in w.views.values())
+    w._clear_view_video("a")
+    assert p["a"].unloads == 0
+    assert "Stop recording" in w.statusBar().currentMessage()
+    w._clear_all_videos()
+    assert p["a"].unloads == 0
+
+
+def test_promoted_master_resets_speed_on_all_views(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    p = _players(w)
+    for player in p.values():
+        player.duration = 10.0
+    w._sync.set_master("b")
+    w._reset_speeds()
+    assert p["a"].speeds[-1] == w.config.speed
+    assert p["b"].speeds[-1] == w.config.speed
+    assert p["c"].speeds[-1] == w.config.speed
+
+
+def test_sync_chip_uses_promoted_reference_label(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    w._sync.set_master("b")
+    w._set_sync_chip({"a": 0.04, "c": -0.12})
+    assert "BA +0.040" in w.sync_chip.text()
+    assert "BC -0.120" in w.sync_chip.text()
+
+
+def test_removing_promoted_reference_promotes_survivor(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    p = _players(w)
+    for player in p.values():
+        player.duration = 10.0
+    for view in w.views.values():
+        view.set_loaded_name("video.mp4")
+    w._clear_view_video("a")  # B is promoted
+    w._clear_view_video("b")  # C is promoted
+    p["b"].duration = 10.0
+    w.views["b"].set_loaded_name("b.mp4")
+    w._remove_last_view()  # removes C, the current reference
+    assert w._sync.master == "b"
+    assert "c" not in w.views
+    assert "c" not in w.engines
+    w._on_ui_tick()  # must not raise KeyError
+
+
+def test_empty_reference_promotes_first_loaded_view(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    p = _players(w)
+    p["b"].duration = 10.0
+    w.views["b"].set_loaded_name("b.mp4")
+    w._on_load_tick()
+    assert w._sync.master == "b"
+    assert set(w.engines) == {"a"}
+
+
+def test_clear_all_videos_unloads_everything(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    p = _players(w)
+    for player in p.values():
+        player.duration = 10.0
+    for view in w.views.values():
+        view.set_loaded_name("video.mp4")
+    w._sync.set_master("b")
+    w._clear_all_videos()
+    assert all(player.unloads == 1 for player in p.values())
+    assert all(view._caption.text() == "no video" for view in w.views.values())
+    assert all(dur is None for dur in w.timeline._dur.values())
+    assert w.sync_chip.text() == "● not synced"
+    assert w._sync.master == "a"
+    assert "a" not in w.engines
+    assert "All videos cleared" in w.statusBar().currentMessage()
 
 
 def test_view_set_owns_order_and_active(qapp: QApplication) -> None:

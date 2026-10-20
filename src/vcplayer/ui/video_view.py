@@ -583,6 +583,7 @@ class VideoView(QFrame):
     context_menu_requested = Signal(str, object)  # view id, QPoint
     drop_zone_changed = Signal(str, str)  # target view id, zone ("" = cleared)
     hover_changed = Signal(str, bool)  # view id, pointer inside/outside
+    clear_requested = Signal(str)  # view id; unload this pane's video
 
     def __init__(self, view_name: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -608,6 +609,15 @@ class VideoView(QFrame):
         header.setSpacing(6)
         header.addWidget(self._badge)
         header.addWidget(self._caption, stretch=1)
+        self.btn_clear = QPushButton()
+        self.btn_clear.setObjectName("miniButton")
+        self.btn_clear.setIcon(make_icon("x", "#a1a1a6"))
+        self.btn_clear.setIconSize(QSize(14, 14))
+        self.btn_clear.setToolTip(f"Clear the video from view {view_name}")
+        self.btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_clear.setVisible(False)
+        header.addWidget(self.btn_clear)
         self._grip = QLabel("⠿")
         self._grip.setObjectName("headerGrip")
         self._grip.setToolTip("Drag the header to rearrange this pane")
@@ -719,6 +729,7 @@ class VideoView(QFrame):
         # that can serve a stale value inside the slot call chain).
         self.surface.zoom_changed.connect(self._on_zoom_changed)
         self.btn_rotate.clicked.connect(self._on_rotate)
+        self.btn_clear.clicked.connect(lambda: self.clear_requested.emit(self.view_name.lower()))
 
     def _cursor_inside(self) -> bool:
         return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
@@ -809,6 +820,29 @@ class VideoView(QFrame):
         self._caption.setText(name)
         self._header.set_title(name)
         self._stack.setCurrentWidget(self.surface)
+        self.btn_clear.setVisible(True)
+        if self._hovered:  # pointer stayed on the pane across clear/reload
+            self.hover_changed.emit(self.view_name.lower(), True)
+
+    @property
+    def has_video(self) -> bool:
+        """Whether this pane currently shows the video surface."""
+        return self._stack.currentWidget() is self.surface
+
+    def clear_loaded(self) -> None:
+        """Return to the empty placeholder after the player unloads."""
+        self._caption.setText("no video")
+        self._header.set_title(f"View {self.view_name}")
+        self.surface.hide()
+        self._stack.setCurrentWidget(self._placeholder)
+        self._time_label.setText("--")
+        self._zoom_label.setText("×1.0")
+        self._playing_icon_state = None
+        self.set_play_text(False)
+        self._set_rotate_text()
+        self.btn_clear.setVisible(False)
+        self._placeholder.update()
+        self.update()
 
     def set_time_text(self, text: str) -> None:
         """Update the per-view time readout."""

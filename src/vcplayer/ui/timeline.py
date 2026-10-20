@@ -46,17 +46,24 @@ COLOR_TICK = QColor(255, 255, 255, 30)
 TRACK_FILL: dict[str, QColor] = {view: QColor(color) for view, color in VIEW_COLORS.items()}
 
 
-def track_x_to_master(x: float, width: float, span: float, view: ViewId, offset: float) -> float:
+def track_x_to_master(
+    x: float,
+    width: float,
+    span: float,
+    view: ViewId,
+    offset: float,
+    master: ViewId = "a",
+) -> float:
     """Map a pixel on any track to master time (clamped to the track range).
 
-    The tracks share one seconds scale: the A track is the master axis
-    itself, every follower track is shifted by its own sync offset.
+    The tracks share one seconds scale: the reference track is the master
+    axis itself, every follower track is shifted by its own sync offset.
     """
     if span <= 0 or width <= 0:
         return 0.0
     frac = min(1.0, max(0.0, x / width))
     t = frac * span
-    return t if view == "a" else t - offset
+    return t if view == master else t - offset
 
 
 def tracks_height(count: int) -> int:
@@ -86,6 +93,7 @@ class TimelineWidget(QWidget):
     def _init_state(self) -> None:
         """Plain-Python state, split out for the no-Qt test fixture."""
         self._views: list[ViewId] = ["a", "b"]
+        self._master: ViewId = "a"
         self._dur: dict[ViewId, float | None] = {}
         self._anchor: dict[ViewId, float | None] = {}
         self._offsets: dict[ViewId, float] = {}
@@ -101,15 +109,29 @@ class TimelineWidget(QWidget):
         """Shared scale: the longest of the loaded durations."""
         return max((d for d in self._dur.values() if d), default=0.0)
 
+    def _is_loaded(self, view: ViewId) -> bool:
+        """A track is interactive only once its video reports a duration."""
+        return self._dur.get(view) is not None
+
     def _offset(self, view: ViewId) -> float:
         """This track's sync offset for scrub mapping (0 when unsynced).
 
         Fed directly by the window layer from each engine's own offset, so
         the mapping can never disagree with the chip/status readouts.
         """
-        if view == "a":
+        if view == self._master:
             return 0.0
         return self._offsets.get(view, 0.0)
+
+    def set_master(self, view: ViewId) -> None:
+        """Set the reference track (the unshifted master axis)."""
+        if view not in self._views:
+            view = self._views[0] if self._views else "a"
+        if view == self._master:
+            return
+        self._master = view
+        self._offsets.pop(view, None)
+        self.update()
 
     def set_tracks(self, views: Sequence[ViewId]) -> None:
         """Set the track list; state of surviving views is preserved."""
@@ -118,6 +140,8 @@ class TimelineWidget(QWidget):
             for view in list(table):
                 if view not in self._views:
                     del table[view]
+        if self._master not in self._views:
+            self._master = self._views[0] if self._views else "a"
         if self._hover_view not in self._views:
             self._hover_view = None
         if self._drag_view not in self._views:
@@ -126,6 +150,8 @@ class TimelineWidget(QWidget):
             self._dur.setdefault(view, None)
             self._anchor.setdefault(view, None)
             self._t.setdefault(view, 0.0)
+        if self._hover_view is not None and not self._is_loaded(self._hover_view):
+            self._set_hover(None)
         self.setMinimumHeight(tracks_height(len(self._views)))
         self.update()
 
@@ -135,6 +161,10 @@ class TimelineWidget(QWidget):
             if view not in self._views:
                 continue
             self._dur[view] = dur if dur and dur > 0 else None
+        if self._hover_view is not None and not self._is_loaded(self._hover_view):
+            self._set_hover(None)
+        if self._drag_view is not None and not self._is_loaded(self._drag_view):
+            self._drag_view = None
         self.update()
 
     def set_anchors(self, anchors: Mapping[ViewId, float | None]) -> None:
@@ -148,7 +178,9 @@ class TimelineWidget(QWidget):
     def set_offsets(self, offsets: Mapping[ViewId, float]) -> None:
         """Set each follower's sync offset used by scrub mapping."""
         self._offsets = {
-            view: off for view, off in offsets.items() if view != "a" and view in self._views
+            view: off
+            for view, off in offsets.items()
+            if view != self._master and view in self._views
         }
         self.update()
 
@@ -165,7 +197,10 @@ class TimelineWidget(QWidget):
         return self._hover_view
 
     def set_hovered_view(self, view: ViewId | None) -> None:
-        """Highlight a track (driven by pane hover); no signal feedback."""
+        """Highlight a loaded track (driven by pane hover); no signal feedback."""
+        if view is not None and not self._is_loaded(view):
+            self._set_hover(None)
+            return
         if view == self._hover_view:
             return
         self._hover_view = view
@@ -181,9 +216,12 @@ class TimelineWidget(QWidget):
         bottom = TRACK_TOP_Y + (len(self._views) - 1) * TRACK_PITCH + TRACK_H + 4.0
         if y < top or y > bottom:
             return None
-        return self._view_at(y)
+        view = self._view_at(y)
+        return view if self._is_loaded(view) else None
 
     def _set_hover(self, view: ViewId | None) -> None:
+        if view is not None and not self._is_loaded(view):
+            view = None
         if view == self._hover_view:
             return
         self._hover_view = view
@@ -201,7 +239,14 @@ class TimelineWidget(QWidget):
 
     def _x_to_master(self, x: float, view: ViewId) -> float:
         usable = max(1.0, float(self.width()) - TRACK_LEFT - TRACK_RIGHT)
-        return track_x_to_master(x - TRACK_LEFT, usable, self._span, view, self._offset(view))
+        return track_x_to_master(
+            x - TRACK_LEFT,
+            usable,
+            self._span,
+            view,
+            self._offset(view),
+            self._master,
+        )
 
     def _emit_preview(self, t: float, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -210,11 +255,14 @@ class TimelineWidget(QWidget):
             self.scrub_preview.emit(t)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        """Start scrubbing on the pressed track; immediate preview."""
+        """Start scrubbing on a loaded track; immediate preview."""
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_view = self._view_at(event.position().y())
-            self._set_hover(self._drag_view)
-            self._emit_preview(self._x_to_master(event.position().x(), self._drag_view), force=True)
+            view = self._view_at(event.position().y())
+            if not self._is_loaded(view):
+                return
+            self._drag_view = view
+            self._set_hover(view)
+            self._emit_preview(self._x_to_master(event.position().x(), view), force=True)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         """Throttled coarse preview while scrubbing; hover highlight otherwise."""
@@ -264,7 +312,8 @@ class TimelineWidget(QWidget):
                 t += step
             for i, view in enumerate(self._views):
                 y = TRACK_TOP_Y + i * TRACK_PITCH
-                self._paint_track(painter, usable, view, y, px_per_sec, view == self._hover_view)
+                hovered = view == self._hover_view and self._is_loaded(view)
+                self._paint_track(painter, usable, view, y, px_per_sec, hovered)
         painter.end()
 
     def _paint_track(

@@ -24,10 +24,13 @@ def format_live_status(
     offsets: dict[ViewId, float],
     drifts: dict[ViewId, float | None],
     fps: float,
+    master_view: ViewId = "a",
 ) -> StatusReadout:
     """Status-bar readout: exact per-pair detail until it stops fitting."""
+    label = master_view.upper()
     parts = [
-        f"A{vid.upper()} {off:+.3f}s ({drift_ms(drifts.get(vid))})" for vid, off in offsets.items()
+        f"{label}{vid.upper()} {off:+.3f}s ({drift_ms(drifts.get(vid))})"
+        for vid, off in offsets.items()
     ]
     if len(offsets) <= 1:
         off = next(iter(offsets.values()), 0.0)
@@ -37,10 +40,10 @@ def format_live_status(
         drift = drifts.get(synced_vid) if synced_vid is not None else None
         if synced_vid is None:
             drift = next(iter(drifts.values()), None)
-        text = f"A {master:8.3f}s | offset {off:+.3f}s | drift {drift_ms(drift)} | {fps:g}fps"
+        text = f"{label} {master:8.3f}s | offset {off:+.3f}s | drift {drift_ms(drift)} | {fps:g}fps"
         return StatusReadout(text=text, tooltip="")
     if len(offsets) == 2:
-        text = f"A {master:8.3f}s | {' | '.join(parts)} | {fps:g}fps"
+        text = f"{label} {master:8.3f}s | {' | '.join(parts)} | {fps:g}fps"
         return StatusReadout(text=text, tooltip="")
     # 3 synced pairs: one line, per-pair detail in the tooltip. The
     # worst-case figure only considers synced pairs.
@@ -49,7 +52,7 @@ def format_live_status(
         default=0.0,
     )
     text = (
-        f"A {master:8.3f}s | {len(offsets)} synced pairs "
+        f"{label} {master:8.3f}s | {len(offsets)} synced pairs "
         f"| max drift {worst * 1000:+.1f}ms | {fps:g}fps"
     )
     return StatusReadout(text=text, tooltip=" | ".join(parts))
