@@ -2,7 +2,7 @@
 
 多视图视频同步对比播放器（2–4 视图动态切换）。为运动分析场景设计：**HLG/Dolby HDR、120fps 高帧率、高码率原片直接播放**（libmpv 硬件解码），无需预转码。
 
-当前版本：**v1.2.0**（2026-10-20）
+当前版本：**v1.2.1**（2026-10-20）
 
 ## 功能（v1.2）
 
@@ -33,7 +33,7 @@
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 ```
 
-产出 `dist\vcplayer.exe`（约 130 MB，已内嵌 libmpv 与图标，版本号 **1.2.0**），发给别人**免安装直接双击**（Windows 10 1809+）。配置与日志写入 `%LOCALAPPDATA%\vcplayer\`。注意：exe 未签名，个别杀软可能误报需手动放行；单文件模式首启需解压，约 5–10 秒。
+产出 `dist\vcplayer.exe`（约 130 MB，已内嵌 libmpv 与图标，版本号 **1.2.1**），发给别人**免安装直接双击**（Windows 10 1809+）。配置与日志写入 `%LOCALAPPDATA%\vcplayer\`。注意：exe 未签名，个别杀软可能误报需手动放行；单文件模式首启需解压，约 5–10 秒。
 
 ## 界面布局
 
