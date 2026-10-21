@@ -69,7 +69,8 @@ class RecordingController(QObject):
             return
         support = rec.probe_capabilities(ffmpeg)
         if support is None:
-            self.message.emit("Recording unavailable: no capture pipeline")
+            logger.warning("recording unavailable: no capture pipeline")
+            self.message.emit("Recording unavailable: no usable capture pipeline")
             return
         if self._window.isMinimized():
             self.message.emit("Restore the window before recording")

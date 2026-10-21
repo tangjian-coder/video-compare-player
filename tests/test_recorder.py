@@ -453,30 +453,68 @@ def test_verdict_exception_forces_failed_not_stuck(
 # -- No-console subprocess flags ---------------------------------------------------
 
 
-def test_probe_subprocesses_suppress_console_windows(
+def _completed(stdout: str = "", returncode: int = 0) -> object:
+    class _Result:
+        def __init__(self) -> None:
+            self.stdout = stdout
+            self.stderr = b"" if returncode == 0 else b"probe failed"
+            self.returncode = returncode
+
+    return _Result()
+
+
+def test_probe_detects_gdigrab_as_input_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """pythonw parents would flash a cmd window per probe subprocess."""
+    """gdigrab is in -devices, not -filters; fallback must still be found."""
     import subprocess as real_subprocess
 
     from vcplayer.core import recorder as rec_mod
 
     calls: list[dict[str, object]] = []
 
-    class _FakeCompleted:
-        returncode = 0
-        stdout = "ddagrab gdigrab h264_nvenc libx264"
-        stderr = ""
-
     def fake_run(cmd: list[str], **kwargs: object) -> object:
         calls.append({"cmd": cmd, "kwargs": kwargs})
-        return _FakeCompleted()
+        text = " ".join(str(part) for part in cmd)
+        if "-filters" in text:
+            return _completed("ddagrab")
+        if "-devices" in text:
+            return _completed("D  gdigrab  GDI API Windows frame grabber")
+        if "-encoders" in text:
+            return _completed("libx264 h264_nvenc")
+        return _completed(returncode=1)  # DDA/NVENC dry-runs unavailable
 
     monkeypatch.setattr(rec_mod.subprocess, "run", fake_run)
-    ff = Path("ffmpeg.exe")
     rec_mod._support_cache.clear()
-    support = rec_mod.probe_capabilities(ff)
+    support = rec_mod.probe_capabilities(Path("ffmpeg.exe"))
     assert support is not None
+    assert support.primary is not None
+    assert support.primary.capture == "gdigrab"
+    assert support.off_primary is not None
     assert calls
     for c in calls:
         assert c["kwargs"]["creationflags"] == real_subprocess.CREATE_NO_WINDOW
+
+
+def test_failed_probe_is_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient DDA failure must be re-probed on the next Rec click."""
+    from vcplayer.core import recorder as rec_mod
+
+    state = {"devices": ""}
+
+    def fake_capture(_ffmpeg: Path, args: list[str]) -> str:
+        if "-devices" in args:
+            return state["devices"]
+        if "-filters" in args:
+            return ""
+        return "libx264"
+
+    monkeypatch.setattr(rec_mod, "_run_capture", fake_capture)
+    rec_mod._support_cache.clear()
+    ff = Path("ffmpeg.exe")
+    assert rec_mod.probe_capabilities(ff) is None
+    state["devices"] = "gdigrab"
+    support = rec_mod.probe_capabilities(ff)
+    assert support is not None
+    assert support.primary is not None
+    assert support.primary.capture == "gdigrab"

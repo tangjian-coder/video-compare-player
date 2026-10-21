@@ -113,6 +113,10 @@ class CaptureSupport:
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
+def _as_text(value: str | bytes) -> str:
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+
+
 def _run_capture(ffmpeg: Path, args: list[str]) -> str:
     """Run ffmpeg with -version-style probes, returning combined output."""
     res = subprocess.run(
@@ -123,7 +127,7 @@ def _run_capture(ffmpeg: Path, args: list[str]) -> str:
         check=False,
         creationflags=_NO_WINDOW,
     )
-    return res.stdout + res.stderr
+    return _as_text(res.stdout) + _as_text(res.stderr)
 
 
 def _dry_run(ffmpeg: Path, args: list[str]) -> bool:
@@ -139,6 +143,9 @@ def _dry_run(ffmpeg: Path, args: list[str]) -> bool:
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("ffmpeg dry-run failed: %s", exc)
         return False
+    if res.returncode != 0:
+        detail = _as_text(res.stderr).strip()
+        logger.warning("ffmpeg dry-run rc=%s: %s", res.returncode, detail[-800:] or "(no output)")
     return res.returncode == 0
 
 
@@ -202,23 +209,29 @@ def _nvenc_dry_run_works(ffmpeg: Path) -> bool:
     return ok
 
 
-# Probing spawns subprocesses; cache per ffmpeg binary.
-_support_cache: dict[str, CaptureSupport | None] = {}
+# Successful probes are stable for the process lifetime. Failures are not
+# cached: DDA can be temporarily unavailable (lock screen/RDP) and must be
+# re-probed on the next explicit Rec click.
+_support_cache: dict[str, CaptureSupport] = {}
 
 
 def probe_capabilities(ffmpeg: Path) -> CaptureSupport | None:
     """Pick the best capture+encode pipelines this machine supports."""
     key = str(ffmpeg)
-    if key in _support_cache:
-        return _support_cache[key]
+    cached = _support_cache.get(key)
+    if cached is not None:
+        return cached
     try:
         encoders = _run_capture(ffmpeg, ["-hide_banner", "-encoders"])
         filters = _run_capture(ffmpeg, ["-hide_banner", "-filters"])
+        devices = _run_capture(ffmpeg, ["-hide_banner", "-devices"])
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("ffmpeg probe failed: %s", exc)
         return None
     has_ddagrab = "ddagrab" in filters
-    has_gdigrab = "gdigrab" in filters
+    # gdigrab is an input device, not a filter; scanning -filters always
+    # disabled the software fallback.
+    has_gdigrab = "gdigrab" in devices
     has_nvenc = "h264_nvenc" in encoders
     has_x264 = "libx264" in encoders
     primary: EncoderProfile | None = None
@@ -238,6 +251,7 @@ def probe_capabilities(ffmpeg: Path) -> CaptureSupport | None:
             has_gdigrab,
             has_x264,
         )
+        return None
     _support_cache[key] = support
     return support
 
