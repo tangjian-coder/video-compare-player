@@ -59,6 +59,18 @@ class PlayerLike(Protocol):
     def set_speed(self, speed: float) -> None: ...
 
 
+def player_frame_rate(player: PlayerLike) -> float:
+    """Resolve a player's frame rate: live property, metadata, then 25 fps."""
+    fps = player.fps
+    if fps and fps > 0:
+        return fps
+    meta = getattr(player, "meta", None)
+    meta_fps = getattr(meta, "fps", None)
+    if isinstance(meta_fps, (int, float)) and meta_fps > 0:
+        return float(meta_fps)
+    return 25.0
+
+
 class SyncEngine:
     """Keeps two players time-aligned via a sync-point offset model."""
 
@@ -123,9 +135,8 @@ class SyncEngine:
 
     @property
     def reference_fps(self) -> float:
-        """Frame rate of the reference view; fallback 25 fps."""
-        fps = self.a.fps
-        return fps if fps and fps > 0 else 25.0
+        """Frame rate of the reference view."""
+        return player_frame_rate(self.a)
 
     def master_range(self) -> tuple[float, float]:
         """Valid master interval where both views have frames."""

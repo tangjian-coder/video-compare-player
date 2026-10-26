@@ -17,13 +17,20 @@ import pytest
 from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QMouseEvent, QPointingDevice
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMenu
 
 from vcplayer.config import AppConfig
 from vcplayer.core.player import PlayerError
 from vcplayer.ui import layout as pane_layout
 from vcplayer.ui.main_window import MainWindow
-from vcplayer.ui.timeline import TRACK_H, TRACK_PITCH, TRACK_TOP_Y, TimelineWidget
+from vcplayer.ui.timeline import (
+    TRACK_H,
+    TRACK_LEFT,
+    TRACK_PITCH,
+    TRACK_RIGHT,
+    TRACK_TOP_Y,
+    TimelineWidget,
+)
 from vcplayer.ui.video_view import VideoView
 
 
@@ -203,6 +210,18 @@ def _players(w: MainWindow) -> dict[str, FakePlayer]:
     return {vid: view.surface._player for vid, view in w.views.items()}  # type: ignore[misc]
 
 
+def _load_only(w: MainWindow, vid: str, duration: float = 10.0) -> dict[str, FakePlayer]:
+    """Make exactly one stub view ready and promote it as the reference."""
+    p = _players(w)
+    p[vid].duration = duration
+    p[vid].meta = object()
+    p[vid].time_pos = 0.0
+    w.views[vid].set_loaded_name(f"{vid}.mp4")
+    w._push_timeline_durations()
+    w._ensure_reference()
+    return p
+
+
 def test_seek_master_all_clamps_to_common_range(qapp: QApplication) -> None:
     w = make_window(qapp, n=3)
     p = _players(w)
@@ -315,6 +334,283 @@ def test_global_play_replaces_solo_playback(qapp: QApplication) -> None:
     assert w._transport.playing
     assert p["a"].plays == 1
     assert p["b"].plays == 1
+
+
+def test_single_loaded_view_transport_works_for_all_presets(qapp: QApplication) -> None:
+    for n in (2, 3, 4):
+        w = make_window(qapp, n=n)
+        w._session.rebuild()
+        p = _load_only(w, "a")
+        assert w._session.master == "a"
+        for _label, preset in pane_layout.presets(w.view_ids):
+            w._set_layout(preset)
+            assert w._layout == preset
+            assert w.view_host.count == n
+            for player in p.values():
+                player.plays = 0
+                player.is_playing = False
+                player.seeks.clear()
+                player.fast_seeks.clear()
+
+            w._toggle_play()
+            assert w._transport.playing
+            assert p["a"].plays == 1
+            assert all(p[vid].plays == 0 for vid in w.view_ids if vid != "a")
+
+            w._toggle_play()  # global pause must stop the sole playing view
+            assert not w._transport.playing
+            assert not p["a"].is_playing
+
+            w._on_seek_committed(4.0)
+            assert p["a"].seeks == [4.0]
+            assert all(p[vid].seeks == [] for vid in w.view_ids if vid != "a")
+
+            p["a"].seeks.clear()
+            w._on_scrub_preview(2.0)
+            assert p["a"].fast_seeks == [2.0]
+
+            p["a"].seeks.clear()
+            w._step(1)
+            assert p["a"].seeks == [pytest.approx(2.0 + 1.0 / 60.0)]
+            w._goto_last()
+            assert p["a"].seeks[-1] == pytest.approx(10.0 - 1.0 / 60.0)
+            w._goto_first()
+            assert p["a"].seeks[-1] == 0.0
+
+
+@pytest.mark.parametrize(("n", "vid"), [(2, "b"), (3, "c"), (4, "d")])
+def test_single_loaded_follower_is_promoted_and_playable(
+    qapp: QApplication, n: int, vid: str
+) -> None:
+    w = make_window(qapp, n=n)
+    w._session.rebuild()
+    p = _load_only(w, vid)
+    assert w._session.master == vid
+    w._toggle_play()
+    assert w._transport.playing
+    assert p[vid].plays == 1
+    assert all(p[other].plays == 0 for other in w.view_ids if other != vid)
+    w._on_seek_committed(3.0)
+    assert p[vid].seeks == [3.0]
+    assert all(p[other].seeks == [] for other in w.view_ids if other != vid)
+
+
+def test_no_loaded_videos_keep_transport_inert(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    w._session.rebuild()
+    p = _players(w)
+    w._toggle_play()
+    assert not w._transport.playing
+    assert w.statusBar().currentMessage() == "Load a video first"
+    w._on_seek_committed(1.0)
+    w._step(1)
+    w._goto_first()
+    assert all(player.seeks == [] for player in p.values())
+
+
+def test_single_solo_playing_view_is_paused_by_global_control(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    p["a"].is_playing = True
+    assert not w._transport.playing
+    w._toggle_play()
+    assert not p["a"].is_playing
+    assert p["a"].plays == 0
+
+
+def test_single_view_restarts_at_zero_after_eof(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    p["a"].time_pos = 10.0
+    p["a"].is_playing = True
+    w._transport.playing = True
+    w._on_ui_tick()
+    assert not w._transport.playing
+    assert not p["a"].is_playing
+    w._toggle_play()
+    assert p["a"].seeks == [0.0]
+    assert p["a"].is_playing
+
+
+def test_pane_pause_during_ensemble_pauses_instead_of_resuming(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    p["b"].meta = object()
+    p["b"].duration = 10.0
+    w._session.rebuild()
+    p["a"].is_playing = p["b"].is_playing = True
+    w._transport.playing = True
+    w._toggle_play_view("a")
+    assert not w._transport.playing
+    assert not p["a"].is_playing
+    assert not p["b"].is_playing
+
+
+def test_default_preset_clears_custom_layout_flag(qapp: QApplication) -> None:
+    w = make_window(qapp, n=4)
+    assert w._set_layout([["a", "b", "c", "d"]])
+    # Default geometry with a stale custom flag: the equality branch must
+    # clear the flag instead of returning without touching it.
+    assert w._set_layout([["a", "b"], ["c", "d"]], customized=True)
+    assert w._layout_customized
+    menu = QMenu()
+    w._populate_layout_menu(menu)
+    action = next(a for a in menu.actions() if a.text() == "Grid (2x2)")
+    action.trigger()
+    assert w._layout == [["a", "b"], ["c", "d"]]
+    assert not w._layout_customized
+    w._remove_last_view()
+    assert w._layout == [["a", "b", "c"]]
+    menu.deleteLater()
+
+
+def test_ready_but_unpainted_master_is_not_demoted(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    w._session.rebuild()
+    p = _players(w)
+    p["a"].meta = object()
+    p["a"].duration = 10.0
+    p["b"]._loading = True
+    w._on_load_progress()
+    assert w._session.master == "a"
+
+    p["b"]._loading = False
+    p["c"]._loading = True
+    w._on_load_progress()
+    assert w._session.master == "a"
+
+
+def test_single_loaded_timeline_click_seeks_master(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    w.timeline.scrub_preview.connect(w._on_scrub_preview)
+    w.timeline.seek_committed.connect(w._on_seek_committed)
+    w.timeline.resize(600, w.timeline.minimumHeight())
+    assert w.timeline._is_loaded("a")
+    assert w.timeline._span == 10.0
+
+    usable = w.timeline.width() - TRACK_LEFT - TRACK_RIGHT
+    x = TRACK_LEFT + usable / 2.0
+    y = TRACK_TOP_Y + TRACK_H / 2.0
+    press = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        QPointF(x, y),
+        QPointF(x, y),
+        QPointF(x, y),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        QPointingDevice.primaryPointingDevice(),
+    )
+    release = QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        QPointF(x, y),
+        QPointF(x, y),
+        QPointF(x, y),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        QPointingDevice.primaryPointingDevice(),
+    )
+    w.timeline.mousePressEvent(press)
+    w.timeline.mouseReleaseEvent(release)
+    assert p["a"].fast_seeks[-1] == pytest.approx(5.0)
+    assert p["a"].seeks[-1] == pytest.approx(5.0)
+
+
+def test_solo_view_at_eof_restarts_on_first_global_play(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    p["a"].time_pos = 10.0
+    p["a"].is_playing = True
+    assert not w._transport.playing
+    w._toggle_play()
+    assert p["a"].seeks == [0.0]
+    assert p["a"].is_playing
+
+
+def test_deferred_resync_does_not_steal_solo_playback(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    p["b"].meta = object()
+    p["b"].duration = 10.0
+    w.views["b"].set_loaded_name("b.mp4")
+    w._session.rebuild()
+    engine = w._session.engines["b"]
+    engine.state.point_a = 0.0
+    engine.state.point_b = 0.0
+    p["a"].time_pos = 5.0
+    p["b"].time_pos = 4.0
+    p["b"].is_playing = True
+    w._resync_if_needed()
+    assert p["b"].seeks == []
+
+
+def test_single_solo_playback_shows_pause_icon(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    p["a"].is_playing = True
+    w._on_ui_tick()
+    assert "Pause" in w.btn_play.toolTip()
+
+
+def test_solo_playback_pauses_while_reference_is_loading(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _players(w)
+    p["a"]._loading = True
+    p["b"].meta = object()
+    p["b"].duration = 10.0
+    p["b"].is_playing = True
+    w.views["b"].set_loaded_name("b.mp4")
+    w._on_ui_tick()
+    assert "Pause" in w.btn_play.toolTip()
+    w._toggle_play()
+    assert not p["b"].is_playing
+
+
+def test_single_solo_playback_at_eof_shows_play_icon(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    p["a"].time_pos = 10.0
+    p["a"].is_playing = True
+    w._on_ui_tick()
+    assert "Pause" not in w.btn_play.toolTip()
+
+
+def test_goto_without_common_range_reports_it(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    p = _players(w)
+    p["a"].duration, p["b"].duration, p["c"].duration = 100.0, 5.0, 2.0
+    p["a"].meta = p["b"].meta = p["c"].meta = object()
+    w._session.add_follower("b")
+    w._session.add_follower("c")
+    w._session.engines["c"].state.point_a = 6.0
+    w._session.engines["c"].state.point_b = 0.0
+    w._transport.goto_first()
+    assert "No common range" in w.statusBar().currentMessage()
+
+
+@pytest.mark.parametrize("n", [2, 3, 4])
+def test_layout_presets_set_custom_flag_by_default_status(qapp: QApplication, n: int) -> None:
+    w = make_window(qapp, n=n)
+    default = pane_layout.default_layout(w.view_ids)
+    menu = QMenu()
+    w._populate_layout_menu(menu)
+    for _label, preset in pane_layout.presets(w.view_ids):
+        action = next(a for a in menu.actions() if a.text() == _label)
+        action.trigger()
+        assert w._layout == preset
+        assert w._layout_customized == (preset != default)
+    menu.deleteLater()
 
 
 def test_failed_reload_promotes_another_reference(
@@ -907,6 +1203,61 @@ def test_initialize_wires_views_and_engines(
     assert "b" in w._session.engines
     assert w.timeline._views == ["a", "b"]
     assert w._initialized
+    w.close()
+
+
+def test_initialize_loads_a_and_b_before_extra_cli_views(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import Path
+
+    def fake_ensure_player(view: VideoView) -> Any:
+        if view.surface._player is None:
+            view.surface._player = FakePlayer()
+        return view.surface._player
+
+    monkeypatch.setattr(VideoView, "ensure_player", fake_ensure_player)
+    monkeypatch.setattr("vcplayer.ui.main_window.rec.warm_up_probe", lambda: None)
+    monkeypatch.setattr(AppConfig, "save", lambda self: None)
+    w = MainWindow(AppConfig())
+    calls: list[tuple[str, str, object]] = []
+    monkeypatch.setattr(w, "open_video", lambda view, path: calls.append(("open", view, path)))
+    monkeypatch.setattr(w, "_add_view", lambda load=None: calls.append(("add", "", load)))
+    paths = [Path(f"{name}.mp4") for name in "abcd"]
+    w.initialize(paths)
+    assert calls == [
+        ("open", "a", paths[0]),
+        ("open", "b", paths[1]),
+        ("add", "", paths[2]),
+        ("add", "", paths[3]),
+    ]
+    w.close()
+
+
+def test_initialize_skips_none_extra_cli_views(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import Path
+
+    def fake_ensure_player(view: VideoView) -> Any:
+        if view.surface._player is None:
+            view.surface._player = FakePlayer()
+        return view.surface._player
+
+    monkeypatch.setattr(VideoView, "ensure_player", fake_ensure_player)
+    monkeypatch.setattr("vcplayer.ui.main_window.rec.warm_up_probe", lambda: None)
+    monkeypatch.setattr(AppConfig, "save", lambda self: None)
+    w = MainWindow(AppConfig())
+    calls: list[tuple[str, str, object]] = []
+    monkeypatch.setattr(w, "open_video", lambda view, path: calls.append(("open", view, path)))
+    monkeypatch.setattr(w, "_add_view", lambda load=None: calls.append(("add", "", load)))
+    paths = [Path("a.mp4"), Path("b.mp4"), None, Path("d.mp4")]
+    w.initialize(paths)  # type: ignore[list-item]
+    assert calls == [
+        ("open", "a", paths[0]),
+        ("open", "b", paths[1]),
+        ("add", "", paths[3]),
+    ]
     w.close()
 
 

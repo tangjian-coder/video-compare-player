@@ -363,13 +363,15 @@ class MainWindow(QMainWindow):
         # only fires toggled on an actual change).
         self.btn_crosshair.setChecked(self.config.crosshair)
 
-        # Views beyond the first two come from the CLI (2-4 videos).
-        for path in videos[2:]:
-            self._add_view(load=path)
+        # Load A/B before extra CLI views: A starts loading first, so the
+        # reference-promotion policy cannot hand the master to C/D.
         if len(videos) > 0 and videos[0] is not None:
             self.open_video("a", videos[0])
         if len(videos) > 1 and videos[1] is not None:
             self.open_video("b", videos[1])
+        for path in videos[2:]:
+            if path is not None:
+                self._add_view(load=path)
         self.statusBar().showMessage("Drop a video into each block to compare")
         # Warm the recorder's ffmpeg probe cache in the background so
         # the first Rec click starts instantly instead of paying ~1s
@@ -451,10 +453,11 @@ class MainWindow(QMainWindow):
         if not presets:
             return
         menu.addSeparator()
+        default = pane_layout.default_layout(self.view_ids)
         for label, preset in presets:
 
             def apply_preset(_checked: bool = False, p: pane_layout.Layout = preset) -> None:
-                self._set_layout(p)
+                self._set_layout(p, customized=p != default)
 
             action = menu.addAction(label, apply_preset)
             action.setCheckable(True)
@@ -726,6 +729,8 @@ class MainWindow(QMainWindow):
             return False
         candidate = [list(row) for row in new_layout]
         if candidate == self._layout:
+            # Reapplying the default preset must clear a stale custom flag.
+            self._layout_customized = customized
             return False
         self._layout = candidate
         self._layout_customized = customized
@@ -1011,7 +1016,7 @@ class MainWindow(QMainWindow):
     def _align_current_frames(self) -> None:
         """One-shot sync: all current frames become the anchors."""
         if not self._transport.any_engine_ready():
-            self.statusBar().showMessage("Load at least two videos first")
+            self.statusBar().showMessage("Load two videos first to align")
             return
         self._stop_playback()
         offsets, error = self._session.align_current()
@@ -1019,7 +1024,7 @@ class MainWindow(QMainWindow):
             logger.warning("align failed: %s", error)
             self.statusBar().showMessage(f"Cannot sync: {error or 'no pair ready'}")
             return
-        rng = self._transport.master_range()
+        rng = self._transport.playable_range()
         master = self.views[self._session.master].player.time_pos
         if rng is not None and master is not None:
             self._seek_master_all(min(max(master, rng[0]), rng[1]))
@@ -1204,7 +1209,7 @@ class MainWindow(QMainWindow):
             self._status_live.setToolTip(readout.tooltip)
         else:
             self._status_live.setText(f"{self._session.master.upper()} not loaded")
-        self._set_play_icon(self._transport.playing)
+        self._set_play_icon(self._transport.effective_playing())
 
     @staticmethod
     def _update_view_time(view: VideoView) -> None:

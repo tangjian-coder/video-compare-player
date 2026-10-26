@@ -50,6 +50,17 @@ class SessionController:
     def any_ready(self) -> bool:
         return self._sync.any_ready
 
+    @property
+    def reference_ready(self) -> bool:
+        """True when the master player can drive playback."""
+        pane = self.views.get(self.master)
+        return bool(pane is not None and pane.surface.has_player and pane.player.is_ready)
+
+    @property
+    def has_ready_view(self) -> bool:
+        """True when any pane's player is fully loaded."""
+        return any(pane.surface.has_player and pane.player.is_ready for pane in self.views.values())
+
     def add_view(self, view: VideoView) -> None:
         self._view_set.add(view)
 
@@ -81,7 +92,7 @@ class SessionController:
         pane = self.views.get(view)
         if pane is None or not pane.surface.has_player:
             return False
-        return pane.shows_surface or pane.player.is_loading
+        return pane.shows_surface or pane.player.is_loading or pane.player.is_ready
 
     def is_waiting(self, view: ViewId) -> bool:
         pane = self.views.get(view)
@@ -100,8 +111,9 @@ class SessionController:
 
     def ensure_reference(self) -> ViewId | None:
         """Promote a replacement only when the current reference is unusable."""
-        current = self.views.get(self.master)
-        if current is not None and self.is_ready(self.master):
+        # Player readiness, not surface visibility: a READY master whose
+        # loaded signal has not painted yet must not be demoted.
+        if self.reference_ready:
             return None
         if self.is_waiting(self.master):
             return None
@@ -121,8 +133,8 @@ class SessionController:
     def current_offsets(self) -> dict[ViewId, float]:
         return self._sync.current_offsets()
 
-    def master_range(self) -> tuple[float, float] | None:
-        return self._sync.master_range()
+    def playable_range(self) -> tuple[float, float] | None:
+        return self._sync.playable_range()
 
     def reference_fps(self) -> float:
         return self._sync.reference_fps()

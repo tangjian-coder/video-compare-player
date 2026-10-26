@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 
 from ..core.player import PlayerController
@@ -10,6 +11,7 @@ from ..core.sync import (
     SyncError,
     ViewId,
     intersect_master_ranges,
+    player_frame_rate,
 )
 from .video_view import VideoView
 
@@ -88,16 +90,37 @@ class SyncSession:
         """Master interval where every ready pair has frames."""
         return intersect_master_ranges(self.engines.values())
 
+    def playable_range(self) -> tuple[float, float] | None:
+        """Transport interval, falling back to the master alone.
+
+        Pair intersections stay authoritative whenever at least one pair is
+        ready. Empty or zero-width intersections are unusable, so disjoint
+        pairs still block seeks. With no ready pair, a ready master exposes
+        its own timeline for single-video playback.
+        """
+        ready = [eng for eng in self.engines.values() if eng.ready]
+        if ready:
+            rng = intersect_master_ranges(ready)
+            if rng is None or rng[1] - rng[0] <= 1e-9:
+                return None
+            return rng
+        master = self._views().get(self.master)
+        if master is None or not master.player.is_ready:
+            return None
+        duration = master.player.duration
+        if duration is None or not math.isfinite(duration) or duration <= 0:
+            return None
+        return 0.0, duration
+
     def reference_fps(self) -> float:
         for eng in self.engines.values():
             if eng.ready:
                 return eng.reference_fps
-        fps = self.master_player.fps
-        return fps if fps and fps > 0 else 25.0
+        return player_frame_rate(self.master_player)
 
     def seek_master_all(self, master: float, *, exact: bool = True) -> bool:
         """Seek the master once and every ready follower to one position."""
-        rng = self.master_range()
+        rng = self.playable_range()
         if rng is None:
             return False
         master = min(max(master, rng[0]), rng[1])

@@ -54,6 +54,21 @@ def test_choose_reference_prefers_ready_then_available() -> None:
     assert session.choose_reference(exclude="b") == "a"
 
 
+def test_reference_and_any_view_readiness_are_distinct() -> None:
+    session = _session()
+    assert session.has_ready_view
+    assert not session.reference_ready
+    assert session.set_master("b")
+    assert session.reference_ready
+
+
+def test_choose_reference_prefers_unpainted_ready_over_loading() -> None:
+    session = _session()
+    _view(session, "b").shows_surface = False
+    _view(session, "c").player.is_loading = True
+    assert session.choose_reference(exclude="a") == "b"
+
+
 def test_ensure_reference_waits_for_loading_master() -> None:
     session = _session()
     a = _view(session, "a")

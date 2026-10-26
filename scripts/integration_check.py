@@ -44,24 +44,31 @@ def main() -> int:
     window = MainWindow(AppConfig())
     window.show()
     window.initialize([LEFT, RIGHT])
-    engine = window.engines["b"]
     view_a = window.views["a"]
     view_b = window.views["b"]
 
-    # engine.ready only needs durations; the players may still be without
-    # VideoMeta (and their first frame) at that point, and _toggle_play
-    # skips views without meta — wait for the full load before playing.
+    # Wait for the full load before playing; _toggle_play skips views
+    # without VideoMeta. Re-fetch the engine afterwards because a
+    # reference promotion rebuilds every SyncEngine.
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
-        if engine.ready and view_a.player.meta is not None and view_b.player.meta is not None:
+        if view_a.player.meta is not None and view_b.player.meta is not None:
             break
         pump(0.1)
-    if not engine.ready or view_a.player.meta is None or view_b.player.meta is None:
+    if view_a.player.meta is None or view_b.player.meta is None:
         print("FAIL: videos did not become ready in time")
+        return 1
+    if window._session.master != "a":
+        print(f"FAIL: reference moved to {window._session.master}")
+        return 1
+    engine = window._session.engines.get("b")
+    if engine is None or not engine.ready:
+        print("FAIL: A/B sync engine is not ready")
         return 1
     pump(0.3)
     fps_ref = engine.reference_fps
-    print(f"ready: fps_ref={fps_ref:.3f}, range={engine.master_range()}")
+    print(f"ready: master={window._session.master}, fps_ref={fps_ref:.3f}")
+    print(f"range={engine.master_range()}")
 
     samples: list[float] = []
     sampler = QTimer()

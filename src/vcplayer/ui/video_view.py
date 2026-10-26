@@ -669,7 +669,7 @@ class VideoView(QFrame):
         self.btn_play.setObjectName("miniButton")
         self.btn_play.setIcon(make_icon("play"))
         self.btn_play.setIconSize(QSize(14, 14))
-        self.btn_play.setToolTip(f"Play/pause {view_name} alone (for finding the sync frame)")
+        self.btn_play.setToolTip(f"Play/pause {view_name} (synced playback stops first)")
         self.btn_rotate = QPushButton()
         self.btn_rotate.setObjectName("miniButton")
         self.btn_rotate.setIcon(make_icon("rotate"))
@@ -860,7 +860,11 @@ class VideoView(QFrame):
             return
         self._playing_icon_state = playing
         self.btn_play.setIcon(make_icon("pause" if playing else "play"))
-        self.btn_play.setToolTip("Pause this view" if playing else "Play this view alone")
+        self.btn_play.setToolTip(
+            "Pause playback (synced playback stops first)"
+            if playing
+            else "Play/pause this view (synced playback stops first)"
+        )
 
     # -- drag & drop on the container (placeholder state) -----------------------
 

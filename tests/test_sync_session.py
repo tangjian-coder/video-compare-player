@@ -87,7 +87,52 @@ def test_seek_master_all_seeks_master_and_followers() -> None:
     assert b.seeks == [5.0]
 
 
-def test_seek_master_all_reports_no_range() -> None:
-    session, _a, _b = make_session()
+def test_seek_master_all_seeks_master_without_followers() -> None:
+    session, a, _b = make_session()
     session.engines.clear()
+    assert session.playable_range() == (0.0, 10.0)
+    assert session.seek_master_all(5.0)
+    assert a.seeks == [5.0]
+
+
+def test_seek_master_all_reports_no_range_when_master_is_unready() -> None:
+    session, a, _b = make_session()
+    session.engines.clear()
+    a.is_ready = False
+    assert session.playable_range() is None
     assert not session.seek_master_all(5.0)
+    assert a.seeks == []
+
+
+def test_playable_range_prefers_ready_pair_intersection() -> None:
+    session, a, b = make_session()
+    b.duration = 7.0
+    assert session.playable_range() == (0.0, 7.0)
+    assert session.playable_range() == session.master_range()
+    assert a.is_ready and b.is_ready
+
+
+def test_playable_range_rejects_zero_width_pair() -> None:
+    session, a, b = make_session()
+    b.duration = 3.0
+    session.engines["b"].state.point_a = 0.0
+    session.engines["b"].state.point_b = 5.0
+    assert session.master_range() == (0.0, 0.0)
+    assert session.playable_range() is None
+    assert not session.seek_master_all(0.0)
+    assert a.seeks == []
+
+
+def test_reference_fps_falls_back_to_meta() -> None:
+    session, a, _b = make_session()
+    session.engines.clear()
+    a.fps = None
+    a.meta = SimpleNamespace(fps=120.0)
+    assert session.reference_fps() == 120.0
+
+
+def test_reference_fps_uses_meta_with_ready_engine() -> None:
+    session, a, _b = make_session()
+    a.fps = None
+    a.meta = SimpleNamespace(fps=120.0)
+    assert session.reference_fps() == 120.0

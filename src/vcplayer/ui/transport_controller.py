@@ -44,8 +44,39 @@ class TransportController:
     def any_engine_ready(self) -> bool:
         return self._session.any_ready
 
-    def master_range(self) -> tuple[float, float] | None:
-        return self._session.master_range()
+    def reference_ready(self) -> bool:
+        return self._session.reference_ready
+
+    def playable_range(self) -> tuple[float, float] | None:
+        return self._session.playable_range()
+
+    def effective_playing(self) -> bool:
+        """Playback state the global button should display.
+
+        A sole loaded view started from its pane button already behaves as
+        global playback, so the global icon must show Pause for it.
+        """
+        if self.playing:
+            return True
+        ready = [
+            view
+            for view in self._session.views.values()
+            if view.surface.has_player and view.player.is_ready
+        ]
+        return (
+            len(ready) == 1
+            and ready[0].player.is_playing
+            and not self._at_stream_end(ready[0].player)
+        )
+
+    def _require_transport(self) -> bool:
+        if self.reference_ready():
+            return True
+        if self._session.has_ready_view:
+            self._notify("The reference view is not ready")
+        else:
+            self._notify("Load a video first")
+        return False
 
     def reference_fps(self) -> float:
         return self._session.reference_fps()
@@ -73,18 +104,26 @@ class TransportController:
             logger.info("playback paused")
             QTimer.singleShot(200, self.resync_if_needed)
             return
-        if not self.master_player.is_ready:
-            self._notify("The reference view is not ready")
+        ready = [view for view in views if view.player.is_ready]
+        # A sole ready view playing on its own is paused by the same global
+        # control, even while another pane is still loading. EOF falls
+        # through so one press rewinds and restarts.
+        if (
+            len(ready) == 1
+            and ready[0].player.is_playing
+            and not self._at_stream_end(ready[0].player)
+        ):
+            ready[0].player.pause()
+            logger.info("playback paused")
             return
-        if not self.any_engine_ready():
-            self._notify("Load at least two videos first")
+        if not self._require_transport():
             return
         # A solo-playing view is not an ensemble session: starting the
         # ensemble pauses it first, then starts every ready view together.
         solo_playing = [view for view in views if view.player.is_playing]
         for view in solo_playing:
             view.player.pause()
-        rng = self.master_range()
+        rng = self.playable_range()
         master = self.master_player.time_pos
         if rng is not None and master is not None and master >= rng[1] - 1e-6:
             self.seek_master_all(rng[0])
@@ -113,6 +152,10 @@ class TransportController:
         """Snap followers only after a pause, never mid-playback."""
         if self.playing or not self.any_engine_ready():
             return
+        if any(
+            view.player.is_ready and view.player.is_playing for view in self._session.views.values()
+        ):
+            return
         self._session.resync_ready()
 
     def seek_master_all(self, master: float, *, exact: bool = True) -> bool:
@@ -123,15 +166,14 @@ class TransportController:
         return True
 
     def step(self, frames: int) -> None:
-        if not self.any_engine_ready():
-            self._notify("Load at least two videos first")
+        if not self._require_transport():
             return
         self.stop()
         master = self.master_player.time_pos
         if master is None:
             return
         master += frames / self.reference_fps()
-        rng = self.master_range()
+        rng = self.playable_range()
         if rng is not None:
             master = min(max(master, rng[0]), rng[1])
         self.seek_master_all(master)
@@ -151,41 +193,47 @@ class TransportController:
         if not player.is_ready:
             self._notify(f"{view.upper()}: load a video first")
             return
+        was_playing = player.is_playing
         if self.playing:
             self.stop()
-        player.toggle_play()
+        if was_playing:
+            player.pause()
+        else:
+            player.play()
         if player.is_playing and self._at_stream_end(player):
             player.seek_exact(0.0)
             player.play()
 
     def goto_first(self) -> None:
-        if not self.any_engine_ready():
-            self._notify("Load at least two videos first")
+        if not self._require_transport():
             return
         self.stop()
-        rng = self.master_range()
-        if rng is not None:
-            self.seek_master_all(rng[0])
+        rng = self.playable_range()
+        if rng is None:
+            if self.any_engine_ready():
+                self._notify("No common range between loaded views")
+            return
+        self.seek_master_all(rng[0])
 
     def goto_last(self) -> None:
-        if not self.any_engine_ready():
-            self._notify("Load at least two videos first")
+        if not self._require_transport():
             return
         self.stop()
-        rng = self.master_range()
-        if rng is not None:
-            self.seek_master_all(max(rng[0], rng[1] - 1.0 / self.reference_fps()))
+        rng = self.playable_range()
+        if rng is None:
+            if self.any_engine_ready():
+                self._notify("No common range between loaded views")
+            return
+        self.seek_master_all(max(rng[0], rng[1] - 1.0 / self.reference_fps()))
 
     def scrub_preview(self, t: float) -> None:
-        if not self.any_engine_ready():
-            self._notify("Load at least two videos first")
+        if not self._require_transport():
             return
         self.stop()
         self.seek_master_all(t, exact=False)
 
     def seek_committed(self, t: float) -> None:
-        if not self.any_engine_ready():
-            self._notify("Load at least two videos first")
+        if not self._require_transport():
             return
         self.stop()
         self.seek_master_all(t)
