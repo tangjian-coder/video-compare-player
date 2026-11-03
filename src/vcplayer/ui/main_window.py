@@ -3,7 +3,7 @@
 Each pane keeps its own frame-step/play controls for the sync-point workflow,
 while TransportController coordinates the ensemble. SessionController owns
 view identity, reference promotion and follower engines; LoadCoordinator polls
-asynchronous loads. Views are added (＋ / V) and removed (－), 2-4 total.
+asynchronous loads. Views are added (＋ / V) and removed (－), 1-4 total.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ SPEED_STEPS = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0]
 UI_TICK_MS = 15  # ~66 Hz so the playhead tracks high-fps video smoothly
 DRIFT_TICK_MS = 100
 
-MIN_VIEWS = 2
+MIN_VIEWS = 1
 MAX_VIEWS = pane_layout.MAX_VIEWS
 ALL_VIEW_IDS: tuple[ViewId, ...] = ("a", "b", "c", "d")
 
@@ -449,6 +449,10 @@ class MainWindow(QMainWindow):
         reset = menu.addAction("Reset layout")
         reset.triggered.connect(self._reset_layout)
         reset.setEnabled(not recording)
+        single = menu.addAction("Single", self._set_single_view)
+        single.setCheckable(True)
+        single.setChecked(len(self.view_ids) == MIN_VIEWS)
+        single.setEnabled(not recording)
         presets = pane_layout.presets(self.view_ids)
         if not presets:
             return
@@ -739,6 +743,15 @@ class MainWindow(QMainWindow):
         self._apply_view_size_policy()
         self.view_host.apply_layout(self._layout, self.views)
         return True
+
+    def _set_single_view(self) -> None:
+        """Remove trailing panes until only A remains, then reset the layout."""
+        if not self._guard_edit("switching to single view"):
+            return
+        while len(self.view_ids) > MIN_VIEWS:
+            self._remove_last_view()
+        self._set_layout(pane_layout.default_layout(self.view_ids), customized=False)
+        self.statusBar().showMessage("Single view")
 
     def _reset_layout(self) -> None:
         if not self._guard_edit("rearranging views"):

@@ -1,6 +1,6 @@
 """Screen recording of the comparison panes via an ffmpeg subprocess.
 
-Records the on-screen region covered by the 2-4 pane grid
+Records the on-screen region covered by the 1-4 pane grid
 (no timeline / transport / status bar) so aligned playback can be
 captured as clean demonstration clips.
 

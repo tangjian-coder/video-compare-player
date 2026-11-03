@@ -152,11 +152,15 @@ def test_remove_last_view_full_bookkeeping(qapp: QApplication) -> None:
     assert w._active_view == "a"  # fell back from the removed view
 
 
-def test_remove_refuses_below_min(qapp: QApplication) -> None:
+def test_remove_to_single_and_refuses_below_one(qapp: QApplication) -> None:
     w = make_window(qapp, n=2)
     w._remove_last_view()
-    assert w.view_ids == ["a", "b"]
-    assert w.view_host.count == 2
+    assert w.view_ids == ["a"]
+    assert w.view_host.count == 1
+    assert w.timeline._views == ["a"]
+    assert w._session.engines == {}
+    w._remove_last_view()
+    assert w.view_ids == ["a"]
 
 
 def test_add_view_refuses_before_initialize(qapp: QApplication) -> None:
@@ -168,7 +172,10 @@ def test_add_view_refuses_before_initialize(qapp: QApplication) -> None:
 
 def test_view_button_gating(qapp: QApplication) -> None:
     w = make_window(qapp, n=2)
+    assert w.btn_add.isEnabled() and w.btn_remove.isEnabled()
+    w._remove_last_view()
     assert w.btn_add.isEnabled() and not w.btn_remove.isEnabled()
+    assert not w._open_actions["b"].isEnabled()
     w2 = make_window(qapp, n=4)
     assert not w2.btn_add.isEnabled() and w2.btn_remove.isEnabled()
     for _vid, action in w2._open_actions.items():
@@ -181,6 +188,57 @@ def test_view_button_gating(qapp: QApplication) -> None:
 def test_four_views_default_to_2x2(qapp: QApplication) -> None:
     w = make_window(qapp, n=4)
     assert w._layout == [["a", "b"], ["c", "d"]]
+
+
+def test_single_layout_action_keeps_only_a_and_transport_works(qapp: QApplication) -> None:
+    w = make_window(qapp, n=4)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    menu = QMenu()
+    w._populate_layout_menu(menu)
+    action = next(a for a in menu.actions() if a.text() == "Single")
+    action.trigger()
+
+    assert w.view_ids == ["a"]
+    assert w._layout == [["a"]]
+    assert not w._layout_customized
+    assert w.view_host.count == 1
+    assert w.timeline._views == ["a"]
+    assert w._session.engines == {}
+    assert not w.btn_remove.isEnabled()
+    assert w.btn_add.isEnabled()
+    assert all(not w._open_actions[vid].isEnabled() for vid in ("b", "c", "d"))
+
+    w._toggle_play()
+    assert w._transport.playing
+    assert p["a"].plays == 1
+    w._on_seek_committed(3.0)
+    assert p["a"].seeks == [3.0]
+
+    single_menu = QMenu()
+    w._populate_layout_menu(single_menu)
+    single_action = next(a for a in single_menu.actions() if a.text() == "Single")
+    assert single_action.isChecked()
+    menu.deleteLater()
+    single_menu.deleteLater()
+
+
+def test_single_view_add_restores_default_dual_layout(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_ensure_player(view: VideoView) -> Any:
+        if view.surface._player is None:
+            view.surface._player = FakePlayer()
+        return view.surface._player
+
+    monkeypatch.setattr(VideoView, "ensure_player", fake_ensure_player)
+    w = make_window(qapp, n=2)
+    w._set_single_view()
+    w._add_view()
+    assert w.view_ids == ["a", "b"]
+    assert w._layout == [["a", "b"]]
+    assert w.btn_remove.isEnabled()
+    assert w._open_actions["b"].isEnabled()
 
 
 def test_drop_on_left_edge_inserts_in_target_row(qapp: QApplication) -> None:
@@ -718,6 +776,8 @@ def test_recording_blocks_presets_and_reset(qapp: QApplication) -> None:
     assert w._layout == [["a", "b"], ["c", "d"]]
     w._reset_layout()
     assert w._layout == [["a", "b"], ["c", "d"]]
+    w._set_single_view()
+    assert w.view_ids == ["a", "b", "c", "d"]
 
 
 def test_drag_finish_clears_shortcuts_and_drop_state(qapp: QApplication) -> None:

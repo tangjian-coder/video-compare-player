@@ -1,11 +1,11 @@
-"""Grid layout model for the 2-4 video panes.
+"""Grid layout model for the 1-4 video panes.
 
 A layout is a list of rows; each row is a non-empty list of view ids
 ("a".."d"). Positions are derived from row lengths only, so the model
 needs no Qt and stays easy to test: every row spans GRID_COLUMNS and the
 row is split evenly (12 is divisible by 1, 2, 3 and 4).
 
-Default per view count: 2 = 1x2, 3 = 1x3, 4 = 2x2. An arranged layout is
+Default per view count: 1 = single, 2 = 1x2, 3 = 1x3, 4 = 2x2. An arranged layout is
 kept as-is when a view is added or removed; only a layout still equal to
 the default transitions to the next default.
 """

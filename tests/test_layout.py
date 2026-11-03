@@ -6,6 +6,7 @@ from vcplayer.ui import layout as pane_layout
 
 
 def test_default_layouts() -> None:
+    assert pane_layout.default_layout(["a"]) == [["a"]]
     assert pane_layout.default_layout(["a", "b"]) == [["a", "b"]]
     assert pane_layout.default_layout(["a", "b", "c"]) == [["a", "b", "c"]]
     assert pane_layout.default_layout(["a", "b", "c", "d"]) == [
@@ -123,6 +124,11 @@ def test_is_valid() -> None:
     assert not pane_layout.is_valid([["a"]], ["a", "b"])
     assert not pane_layout.is_valid([["a", "b"], []], ["a", "b"])
     assert not pane_layout.is_valid([["a", "a"]], ["a", "b"])
+
+
+def test_single_has_no_arrangement_presets() -> None:
+    assert pane_layout.presets(["a"]) == []
+    assert pane_layout.is_valid([["a"]], ["a"])
 
 
 def test_presets_are_valid() -> None:

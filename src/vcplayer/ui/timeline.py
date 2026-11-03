@@ -4,7 +4,7 @@ All tracks share the same seconds-to-pixels scale (span = the longest
 video), so the knobs move at identical speed during playback and each
 track's sync anchor sits at the same physical moment. Each track spans
 its own video's full duration; the tail beyond it renders as a dead
-zone. The track list is dynamic (2-4 views) and the height follows it.
+zone. The track list is dynamic (1-4 views) and the height follows it.
 """
 
 from __future__ import annotations

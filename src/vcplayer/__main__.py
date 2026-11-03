@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
         "videos",
         nargs="*",
         type=Path,
-        help="2-4 videos: first two fill views A/B, each extra adds a view",
+        help="1-4 videos: first two fill views A/B, each extra adds a view",
     )
     parser.add_argument("--debug", action="store_true", help="enable debug logging")
     args = parser.parse_args(argv)
