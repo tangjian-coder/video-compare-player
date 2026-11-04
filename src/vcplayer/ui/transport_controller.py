@@ -70,6 +70,9 @@ class TransportController:
         )
 
     def _require_transport(self) -> bool:
+        if self._session.has_missing_source:
+            self._notify("Reload or clear the missing source first")
+            return False
         if self.reference_ready():
             return True
         if self._session.has_ready_view:
@@ -159,6 +162,9 @@ class TransportController:
         self._session.resync_ready()
 
     def seek_master_all(self, master: float, *, exact: bool = True) -> bool:
+        if self._session.has_missing_source:
+            self._notify("Reload or clear the missing source first")
+            return False
         if not self._session.seek_master_all(master, exact=exact):
             if self.any_engine_ready():
                 self._notify("No common range between loaded views")
@@ -182,12 +188,18 @@ class TransportController:
         pane = self._session.views.get(view)
         if pane is None:
             return
+        if self._session.has_missing_source:
+            self._notify("Reload or clear the missing source first")
+            return
         self.stop()
         pane.player.step_frames(frames)
 
     def toggle_view(self, view: ViewId) -> None:
         pane = self._session.views.get(view)
         if pane is None:
+            return
+        if self._session.has_missing_source:
+            self._notify("Reload or clear the missing source first")
             return
         player = pane.player
         if not player.is_ready:

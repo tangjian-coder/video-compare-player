@@ -271,6 +271,9 @@ QFrame#videoView[activePane="true"] {
 QFrame#videoView[trackHover="true"] {
     border-color: rgba(255, 255, 255, 105);
 }
+QFrame#videoView[sourceMissing="true"] {
+    border-color: rgba(255, 69, 58, 180);
+}
 QFrame#videoView[dragSource="true"] {
     border: 2px dashed #6e6e73;
 }
@@ -312,6 +315,9 @@ QLabel#viewBadgeD {
 QLabel#captionLabel {
     color: #c7c7cc;
     font-size: 9.5pt;
+}
+QLabel#captionLabel[sourceMissing="true"] {
+    color: #ff6961;
 }
 QLabel#headerGrip {
     color: #5c5c60;

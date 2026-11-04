@@ -244,11 +244,11 @@ def test_single_layout_action_keeps_only_a_and_transport_works(
     w._goto_first()
     assert p["a"].seeks[-1] == 0.0
 
+    assert not w.btn_layout.isEnabled()
+    assert "Add another view" in w.btn_layout.toolTip()
     single_menu = QMenu()
     w._populate_layout_menu(single_menu)
-    single_action = next(a for a in single_menu.actions() if a.text() == "Single (close others)")
-    assert not single_action.isCheckable()
-    assert not single_action.isEnabled()
+    assert single_menu.actions() == []
     menu.deleteLater()
     single_menu.deleteLater()
 
@@ -307,6 +307,91 @@ def test_single_align_without_video_asks_for_a_video(qapp: QApplication) -> None
     w._set_single_view()
     w._align_current_frames()
     assert w.statusBar().currentMessage() == "Load a video first"
+
+
+def test_missing_source_pauses_and_blocks_session(qapp: QApplication) -> None:
+    from pathlib import Path
+
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    p["b"].duration = 10.0
+    p["b"].meta = object()
+    p["b"].time_pos = 0.0
+    w.views["b"].set_loaded_name("b.mp4")
+    source = Path("clip.mp4")
+    w._source_monitor.track("a", source)
+    p["a"].is_playing = True
+    w._transport.playing = True
+
+    w._on_source_missing("a", source)
+    assert w.views["a"].source_missing
+    assert "missing" in w.views["a"]._caption.text()
+    assert not p["a"].is_playing
+    assert not w._transport.playing
+    assert not w.views["a"].btn_play.isEnabled()
+    assert not w.views["b"].btn_play.isEnabled()
+    assert not w.views["b"].btn_step_fwd.isEnabled()
+    assert "deleted or moved" in w.statusBar().currentMessage()
+
+    w._toggle_play()
+    assert w.statusBar().currentMessage() == "Reload or clear the missing source first"
+    w._toggle_play_view("b")
+    assert not p["b"].is_playing
+    assert w.statusBar().currentMessage() == "Reload or clear the missing source first"
+    w._step_view("b", 1)
+    assert w.statusBar().currentMessage() == "Reload or clear the missing source first"
+    w._align_current_frames()
+    assert w.statusBar().currentMessage() == "Reload or clear the missing source first"
+
+    w._clear_view_video("a")
+    assert not w.views["a"].source_missing
+    assert w.views["a"].btn_play.isEnabled()
+    assert w.views["b"].btn_play.isEnabled()
+    assert w.views["b"].btn_step_fwd.isEnabled()
+
+
+def test_stale_missing_event_is_ignored(qapp: QApplication) -> None:
+    from pathlib import Path
+
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    w._source_monitor.track("a", Path("new.mp4"))
+    w._on_source_missing("a", Path("old.mp4"))
+    assert not w.views["a"].source_missing
+
+
+def test_single_view_hides_layout_controls(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._set_single_view()
+    assert not w.btn_layout.isEnabled()
+    assert "Add another view" in w.btn_layout.toolTip()
+    menu = QMenu()
+    w._populate_layout_menu(menu)
+    assert menu.actions() == []
+    menu.deleteLater()
+
+
+@pytest.mark.parametrize(
+    ("n", "labels"),
+    [
+        (2, ["Side by side", "Stacked"]),
+        (3, ["Row (1x3)", "Top 2 + 1", "Stacked (3 rows)"]),
+        (4, ["Grid (2x2)", "Row (1x4)", "Top 3 + 1"]),
+    ],
+)
+def test_layout_menu_lists_only_current_presets(
+    qapp: QApplication, n: int, labels: list[str]
+) -> None:
+    w = make_window(qapp, n=n)
+    assert w.btn_layout.isEnabled()
+    menu = QMenu()
+    w._populate_layout_menu(menu)
+    actions = [a for a in menu.actions() if not a.isSeparator()]
+    assert [a.text() for a in actions] == ["Reset layout", "Single (close others)", *labels]
+    assert next(a for a in actions if a.text() == labels[0]).isChecked()
+    menu.deleteLater()
 
 
 def test_single_with_empty_a_destroys_the_only_loaded_video(qapp: QApplication) -> None:

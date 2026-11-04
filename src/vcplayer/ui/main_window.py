@@ -43,6 +43,7 @@ from .load_coordinator import LoadCoordinator
 from .pane_drag import VIDEO_EXTS
 from .recording_controller import RecordingController
 from .session_controller import SessionController
+from .source_monitor import SourceMonitor
 from .status_presenter import (
     PlayheadSmoother,
     format_live_status,
@@ -248,6 +249,8 @@ class MainWindow(QMainWindow):
 
         self._active_view = "a"
         self._loads = LoadCoordinator(self)
+        self._source_monitor = SourceMonitor(self)
+        self._source_monitor.missing.connect(self._on_source_missing)
         self._load_failures: list[str] = []
         self._showing_load_failure = False
         self._transport = TransportController(self._session, config, self._notify)
@@ -346,7 +349,7 @@ class MainWindow(QMainWindow):
         self._add_shortcut(Qt.Key.Key_R, self._clear_sync)
         self._add_shortcut(Qt.Key.Key_F9, self._toggle_record)
         self._add_shortcut(Qt.Key.Key_C, self._toggle_crosshair)
-        self._add_shortcut(Qt.Key.Key_V, self._add_view)
+        self._add_shortcut(Qt.Key.Key_V, self._add_view_from_shortcut)
         self._add_shortcut(QKeySequence.StandardKey.Open, self._open_active)
 
         self._ui_timer.start(UI_TICK_MS)
@@ -445,25 +448,31 @@ class MainWindow(QMainWindow):
         self.btn_play.setAccessibleName("Pause" if playing else "Play")
 
     def _populate_layout_menu(self, menu: QMenu) -> None:
-        """(Re)build the layout menu; disabled while recording."""
+        """(Re)build the layout menu; empty when there is nothing to arrange."""
         menu.clear()
         menu.setToolTipsVisible(True)
+        if len(self.view_ids) == MIN_VIEWS:
+            return
         recording = self._recording()
         reset = menu.addAction("Reset layout")
         reset.triggered.connect(self._reset_layout)
         reset.setEnabled(not recording)
         single = menu.addAction("Single (close others)", self._set_single_view)
         single.setToolTip("Close other views and keep only A; their loaded videos are unloaded")
-        single.setEnabled(not recording and len(self.view_ids) > MIN_VIEWS)
-        presets = pane_layout.presets(self.view_ids)
-        if not presets:
+        single.setEnabled(not recording)
+
+        entries = pane_layout.presets(self.view_ids)
+        if not entries:
             return
         menu.addSeparator()
-        default = pane_layout.default_layout(self.view_ids)
-        for label, preset in presets:
+        for label, preset in entries:
 
-            def apply_preset(_checked: bool = False, p: pane_layout.Layout = preset) -> None:
-                self._set_layout(p, customized=p != default)
+            def apply_preset(
+                _checked: bool = False,
+                p: pane_layout.Layout = preset,
+                text: str = label,
+            ) -> None:
+                self._apply_layout_preset(p, text)
 
             action = menu.addAction(label, apply_preset)
             action.setCheckable(True)
@@ -491,6 +500,7 @@ class MainWindow(QMainWindow):
         self._drift_timer.stop()
         self._transport.playing = False
         self._loads.clear()
+        self._source_monitor.clear()
         self._reset_hover()
         self._rec_controller.terminate()  # finalize the mp4 before we die
         self.config.window.width = self.width()
@@ -520,17 +530,21 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    def _add_view(self, load: Path | None = None) -> None:
+    def _add_view_from_shortcut(self) -> None:
+        """Shortcut adapter; add-view returns success for callers that care."""
+        self._add_view()
+
+    def _add_view(self, load: Path | None = None) -> bool:
         """Append a new view (up to MAX_VIEWS); optionally load a video."""
         if not self._guard_edit("changing views"):
-            return
+            return False
         if len(self.view_ids) >= MAX_VIEWS:
             self.statusBar().showMessage(f"Maximum {MAX_VIEWS} views")
-            return
+            return False
         vid: ViewId = ALL_VIEW_IDS[len(self.view_ids)]
         if vid in self.views:
             logger.error("view id %s already registered; refusing to add", vid)
-            return
+            return False
         view = VideoView(vid.upper())
         # Parent the widget before creating its player: ensure_player() hands
         # the pane's native window to mpv, and reparenting afterwards could
@@ -566,7 +580,7 @@ class MainWindow(QMainWindow):
             self.view_host.apply_layout(self._layout, self.views)
             self._refresh_view_buttons()
             QMessageBox.warning(self, "mpv error", str(exc))
-            return
+            return False
         self._refresh_view_buttons()
         self.timeline.set_tracks(self.view_ids)
         self._refresh_sync_ui()
@@ -575,6 +589,7 @@ class MainWindow(QMainWindow):
             self.open_video(vid, load)
         else:
             self.statusBar().showMessage(f"View {vid.upper()} added — drop or open a video")
+        return True
 
     def _remove_last_view(self) -> None:
         """Tear down the most recently added view (A stays)."""
@@ -629,6 +644,7 @@ class MainWindow(QMainWindow):
     def _destroy_view(self, vid: ViewId, *, replacement: ViewId | None = None) -> None:
         """Remove a view from state and life (player released)."""
         self._loads.cancel(vid)
+        self._source_monitor.forget(vid)
         view = self._session.pop_view(vid, replacement=replacement)
         if view is not None:
             with contextlib.suppress(RuntimeError):
@@ -750,6 +766,12 @@ class MainWindow(QMainWindow):
         self.view_host.apply_layout(self._layout, self.views)
         return True
 
+    def _apply_layout_preset(self, preset: pane_layout.Layout, label: str) -> None:
+        """Apply a preset to the current views."""
+        default = pane_layout.default_layout(self.view_ids)
+        if self._set_layout(preset, customized=preset != default):
+            self.statusBar().showMessage(f"Layout applied — {label}")
+
     def _set_single_view(self) -> None:
         """Remove trailing panes until only A remains, then reset the layout."""
         if not self._guard_edit("switching to single view"):
@@ -774,6 +796,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Layout already default")
 
     def _on_view_context_menu(self, _view_id: str, global_pos: QPoint) -> None:
+        if len(self.view_ids) == MIN_VIEWS:
+            return
         menu = QMenu(self)
         self._populate_layout_menu(menu)
         menu.exec(global_pos)
@@ -786,9 +810,19 @@ class MainWindow(QMainWindow):
             action.setEnabled(vid in self.views and can_edit)
         self.btn_add.setEnabled(can_edit and len(self.view_ids) < MAX_VIEWS)
         self.btn_remove.setEnabled(can_edit and len(self.view_ids) > MIN_VIEWS)
+        self.btn_layout.setEnabled(can_edit and len(self.view_ids) > MIN_VIEWS)
+        self.btn_layout.setToolTip(
+            "Add another view first (＋ / V)"
+            if len(self.view_ids) == MIN_VIEWS
+            else "Arrange panes, or switch to Single and unload the other views"
+        )
         self._clear_all_action.setEnabled(can_edit)
+        playable = not self._session.has_missing_source
         for view in self.views.values():
             view.btn_clear.setEnabled(can_edit)
+            view.btn_play.setEnabled(playable)
+            view.btn_step_back.setEnabled(playable)
+            view.btn_step_fwd.setEnabled(playable)
 
     # -- loading / clearing -------------------------------------------------------
 
@@ -826,6 +860,7 @@ class MainWindow(QMainWindow):
         new_master = self._reference_candidate(vid) if vid == self._session.master else None
         self._stop_playback()
         self._loads.cancel(vid)
+        self._source_monitor.forget(vid)
         pane = self.views[vid]
         try:
             pane.player.unload()
@@ -840,6 +875,7 @@ class MainWindow(QMainWindow):
         self._push_timeline_durations()
         self._reset_hover()
         self._refresh_sync_ui()
+        self._refresh_view_buttons()
         logger.info("view %s cleared", vid)
         if new_master is not None:
             self.statusBar().showMessage(
@@ -857,6 +893,7 @@ class MainWindow(QMainWindow):
             return
         self._stop_playback()
         self._loads.clear()
+        self._source_monitor.clear()
         for vid in self.view_ids:
             pane = self.views[vid]
             try:
@@ -873,6 +910,7 @@ class MainWindow(QMainWindow):
         self._push_timeline_durations()
         self._reset_hover()
         self._refresh_sync_ui()
+        self._refresh_view_buttons()
         logger.info("all videos cleared")
         self.statusBar().showMessage("All videos cleared")
 
@@ -899,8 +937,10 @@ class MainWindow(QMainWindow):
         except PlayerError as exc:
             QMessageBox.warning(self, "open failed", str(exc))
             return
-        # Only a successfully accepted load invalidates the old file's sync:
-        # a failed dialog/file pick leaves the current session untouched.
+        # Only a successfully accepted load stops watching the old source.
+        self._source_monitor.forget(view)
+        self.views[view].set_source_missing(False)
+        # A failed dialog/file pick leaves the current session untouched.
         # (A reload of A breaks every pair, a follower only its own.)
         self._invalidate_sync(view)
         self._loads.start(view, path, self.views[view].player)
@@ -922,18 +962,41 @@ class MainWindow(QMainWindow):
         view = self.views.get(vid)
         if view is None:
             return
-        name = Path(str(path)).name
+        source = Path(str(path))
+        name = source.name
         view.set_loaded_name(name)
+        self._source_monitor.track(vid, source)
         self._notify(f"{vid.upper()}: {name} loaded")
         self._push_timeline_durations()
         self._ensure_reference()
         self._refresh_view_buttons()
+
+    def _on_source_missing(self, view_id: str, path: object) -> None:
+        """Pause and mark a pane whose source file was deleted or moved."""
+        if self._closing:
+            return
+        vid = cast(ViewId, view_id)
+        source = Path(str(path))
+        if self._source_monitor.path_for(vid) != source:
+            return  # stale event from a path that was already reloaded
+        view = self.views.get(vid)
+        if view is None or not view.player.is_ready:
+            return
+        self._transport.stop()
+        view.player.pause()
+        view.set_source_missing(True)
+        self._refresh_view_buttons()
+        logger.warning("view %s source missing: %s", vid, source)
+        self.statusBar().showMessage(
+            f"{vid.upper()}: source file was deleted or moved — reload or clear to continue"
+        )
 
     def _on_load_failed(self, view_id: str, path: object, message: str) -> None:
         """A load failed: make the pane consistent, then report asynchronously."""
         if self._closing:
             return
         vid = cast(ViewId, view_id)
+        self._source_monitor.forget(vid)
         view = self.views.get(vid)
         if view is not None:
             view.clear_loaded()
@@ -1038,6 +1101,9 @@ class MainWindow(QMainWindow):
 
     def _align_current_frames(self) -> None:
         """One-shot sync: all current frames become the anchors."""
+        if self._session.has_missing_source:
+            self.statusBar().showMessage("Reload or clear the missing source first")
+            return
         if not self._transport.any_engine_ready():
             if len(self.view_ids) == MIN_VIEWS:
                 message = (

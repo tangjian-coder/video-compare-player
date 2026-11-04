@@ -595,6 +595,8 @@ class VideoView(QFrame):
         self.setAcceptDrops(True)  # catches drops while the placeholder is showing
         self._drag_source_active = False
         self._playing_icon_state: bool | None = None
+        self._loaded_name: str | None = None
+        self._source_missing = False
         self._hovered = False
         self.setProperty("trackHover", "")
         self.setProperty("activePane", "")
@@ -823,12 +825,40 @@ class VideoView(QFrame):
 
     def set_loaded_name(self, name: str) -> None:
         """Show the loaded file name and switch from placeholder to video."""
-        self._caption.setText(name)
-        self._header.set_title(name)
+        self._loaded_name = name
+        self._source_missing = False
+        self._render_source_label()
         self._stack.setCurrentWidget(self.surface)
         self.btn_clear.setVisible(True)
         if self._hovered:  # pointer stayed on the pane across clear/reload
             self.hover_changed.emit(self.view_id, True)
+
+    @property
+    def source_missing(self) -> bool:
+        """True when the source file disappeared after it was loaded."""
+        return self._source_missing
+
+    def set_source_missing(self, missing: bool) -> None:
+        """Mark a loaded source as missing without unloading its last frame."""
+        if self._source_missing == missing:
+            return
+        self._source_missing = missing
+        self._render_source_label()
+
+    def _render_source_label(self) -> None:
+        if self._loaded_name is None:
+            return
+        text = f"{self._loaded_name} (missing)" if self._source_missing else self._loaded_name
+        self._caption.setText(text)
+        self._header.set_title(text)
+        self._caption.setToolTip(
+            f"{text}\nSource file was deleted or moved; reload or clear to continue"
+            if self._source_missing
+            else text
+        )
+        set_style_property(self, "sourceMissing", "true" if self._source_missing else "")
+        set_style_property(self._caption, "sourceMissing", "true" if self._source_missing else "")
+        self._header.update()
 
     @property
     def shows_surface(self) -> bool:
@@ -837,8 +867,13 @@ class VideoView(QFrame):
 
     def clear_loaded(self) -> None:
         """Return to the empty placeholder after the player unloads."""
+        self._loaded_name = None
+        self._source_missing = False
         self._caption.setText("no video")
+        self._caption.setToolTip("")
         self._header.set_title(f"View {self.view_name}")
+        set_style_property(self, "sourceMissing", "")
+        set_style_property(self._caption, "sourceMissing", "")
         self.surface.hide()
         self._stack.setCurrentWidget(self._placeholder)
         self._time_label.setText("--")

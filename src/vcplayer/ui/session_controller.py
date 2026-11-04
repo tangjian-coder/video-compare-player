@@ -61,6 +61,11 @@ class SessionController:
         """True when any pane's player is fully loaded."""
         return any(pane.surface.has_player and pane.player.is_ready for pane in self.views.values())
 
+    @property
+    def has_missing_source(self) -> bool:
+        """True when a loaded pane's source file has disappeared."""
+        return any(pane.source_missing for pane in self.views.values())
+
     def add_view(self, view: VideoView) -> None:
         self._view_set.add(view)
 
