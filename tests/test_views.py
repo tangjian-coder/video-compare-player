@@ -11,6 +11,8 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # before QApplication
 
+from concurrent.futures import Future
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -114,6 +116,29 @@ class FakePlayer:
     def seek_fast(self, t: float) -> None:
         self.fast_seeks.append(t)
         self.time_pos = t
+
+
+class SlowFakePlayer(FakePlayer):
+    """Player whose async seeks stay pending until the test resolves them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fast_async: list[float] = []
+        self.exact_async: list[float] = []
+        self.pending: list[Future[Any]] = []
+
+    def _future(self) -> Future[Any]:
+        future: Future[Any] = Future()
+        self.pending.append(future)
+        return future
+
+    def seek_fast_async(self, t: float) -> Future[Any]:
+        self.fast_async.append(t)
+        return self._future()
+
+    def seek_exact_async(self, t: float) -> Future[Any]:
+        self.exact_async.append(t)
+        return self._future()
 
 
 @pytest.fixture(scope="module")
@@ -349,6 +374,419 @@ def test_missing_source_pauses_and_blocks_session(qapp: QApplication) -> None:
     assert w.views["a"].btn_play.isEnabled()
     assert w.views["b"].btn_play.isEnabled()
     assert w.views["b"].btn_step_fwd.isEnabled()
+
+
+def test_open_video_shows_loading_feedback(qapp: QApplication, tmp_path: Path) -> None:
+    w = make_window(qapp, n=2)
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"x")
+    w.open_video("a", path)
+    view = w.views["a"]
+    assert view.loading
+    assert view._stack.currentWidget() is view._loading_page
+    assert view._loading_name.text() == "clip.mp4"
+    assert not view.btn_play.isEnabled()
+    assert "opening clip.mp4" in w.statusBar().currentMessage()
+
+    w._on_video_loaded("a", path, object())
+    assert not view.loading
+    assert view._stack.currentWidget() is view.surface
+    assert view.btn_play.isEnabled()
+    w._loads.clear()
+    w._source_monitor.clear()
+
+
+def test_placeholder_pages_are_parented(qapp: QApplication) -> None:
+    view = VideoView("A")
+    assert view._placeholder.parent() is view
+    assert view._loading_page.parent() is view
+
+
+def test_async_seek_releases_timeline_preview(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+
+    w._on_scrub_preview(2.0)
+    assert w.timeline._t["a"] == pytest.approx(2.0)
+    w.timeline.set_playheads({"a": 0.0})
+    assert w.timeline._t["a"] == pytest.approx(2.0)
+
+    w._on_seek_committed(2.0)
+    assert w._transport.exact_seek_pending
+    w._on_ui_tick()
+    assert not w._transport.exact_seek_pending
+    assert w.timeline._t["a"] == pytest.approx(2.0)
+
+
+def test_preview_coalesces_and_exact_wins(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.duration = 10.0
+    player.meta = object()
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._on_scrub_preview(2.0)
+    w._on_scrub_preview(3.0)
+    assert player.fast_async == [2.0]
+    assert w.timeline._t["a"] == pytest.approx(3.0)
+
+    player.pending.pop(0).set_result(None)
+    w._on_ui_tick()
+    assert player.fast_async == [2.0, 3.0]
+
+    w._on_seek_committed(4.0)
+    assert player.exact_async == [4.0]
+    assert player.seeks == []
+    assert player.pending.pop(0).cancelled()
+    player.time_pos = 4.0
+    player.pending.pop(0).set_result(None)
+    w._on_ui_tick()
+    assert not w._transport.exact_seek_pending
+    assert not w.timeline._preview_hold
+
+
+def test_solo_playback_keeps_fast_ui_rate(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    p["b"].meta = object()
+    p["b"].duration = 10.0
+    p["b"].time_pos = 0.0
+    w._update_ui_rate()
+    assert w._ui_timer.interval() == 100
+
+    w._toggle_play_view("b")
+    assert p["b"].is_playing
+    assert w._ui_timer.interval() == 16
+    w._toggle_play_view("b")
+    assert w._ui_timer.interval() == 100
+
+
+def test_align_waits_for_pending_exact_seek(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.meta = object()
+    player.duration = 10.0
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._on_seek_committed(4.0)
+    assert w._transport.exact_seek_pending
+    w._align_current_frames()
+    assert "Wait for the current seek" in w.statusBar().currentMessage()
+    assert player.exact_async == [4.0]
+    player.time_pos = 4.0
+    player.pending.pop(0).set_result(None)
+    w._on_ui_tick()
+
+
+def test_seek_timeout_invalidates_late_completion(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.meta = object()
+    player.duration = 10.0
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._on_seek_committed(4.0)
+    w._transport._commit_started -= 3.0
+    w._on_ui_tick()
+    assert not w._transport.exact_seek_pending
+    assert player.pending.pop(0).cancelled()
+    assert "timed out" in w.statusBar().currentMessage()
+
+    player.time_pos = 4.0
+    w._on_ui_tick()
+    assert not w._transport.exact_seek_pending
+
+
+def test_seek_target_is_clamped_before_virtual_step(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.meta = object()
+    player.duration = 10.0
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._on_seek_committed(20.0)
+    assert player.exact_async == [10.0]
+    assert w._transport._commit_target == pytest.approx(10.0)
+    player.time_pos = 10.0
+    player.pending.pop(0).set_result(None)
+    w._on_ui_tick()
+
+
+def test_single_frame_step_waits_for_position_change(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.meta = object()
+    player.duration = 10.0
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._step(1)
+    assert player.exact_async == [pytest.approx(1.0 / 60.0)]
+    player.pending.pop(0).set_result(None)
+    w._on_ui_tick()
+    assert w._transport.exact_seek_pending
+
+    player.time_pos = 1.0 / 60.0
+    w._on_ui_tick()
+    assert not w._transport.exact_seek_pending
+
+
+def test_exact_seek_waits_for_all_views_to_land(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    slow: list[SlowFakePlayer] = []
+    for vid in ("a", "b"):
+        player = SlowFakePlayer()
+        player.meta = object()
+        player.duration = 100.0
+        player.time_pos = 0.0
+        w.views[vid].surface._player = player  # type: ignore[assignment]
+        slow.append(player)
+    w._session.rebuild()
+
+    w._on_seek_committed(10.0)
+    assert [player.exact_async for player in slow] == [[10.0], [10.0]]
+    for player in slow:
+        player.pending.pop(0).set_result(None)
+    slow[0].time_pos = 10.0
+    slow[1].time_pos = 0.0
+    w._on_ui_tick()
+    assert w._transport.exact_seek_pending
+
+    slow[1].time_pos = 10.0
+    w._on_ui_tick()
+    assert not w._transport.exact_seek_pending
+
+
+def test_play_waits_for_pending_exact_seek(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.meta = object()
+    player.duration = 10.0
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._on_seek_committed(4.0)
+    w._toggle_play()
+    assert not w._transport.playing
+    assert w._transport._play_after_seek
+    player.time_pos = 4.0
+    player.pending.pop(0).set_result(None)
+    w._on_ui_tick()
+    assert w._transport.playing
+    assert player.is_playing
+
+
+def test_play_cancels_pending_preview(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.meta = object()
+    player.duration = 10.0
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._on_scrub_preview(2.0)
+    assert w.timeline.preview_hold
+    preview = player.pending.pop(0)
+    w._toggle_play()
+    assert preview.cancelled()
+    assert w._transport.playing
+    assert not w._transport.preview_pending
+    w._on_ui_tick()
+    assert player.fast_async == [2.0]
+    assert not w.timeline.preview_hold
+
+
+def test_second_play_press_cancels_play_after_seek(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.meta = object()
+    player.duration = 10.0
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._on_seek_committed(4.0)
+    w._toggle_play()
+    assert w._transport._play_after_seek
+    w._toggle_play()
+    assert not w._transport._play_after_seek
+
+    player.time_pos = 4.0
+    player.pending.pop(0).set_result(None)
+    w._on_ui_tick()
+    assert not w._transport.playing
+    assert not player.is_playing
+
+
+def test_preview_hold_has_watchdog(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+
+    w.timeline.preview_master(2.0)
+    assert w.timeline.preview_hold
+    w.timeline._last_preview_at -= 2.0
+    w._on_ui_tick()
+    assert not w.timeline.preview_hold
+
+
+def test_stale_preview_completion_keeps_new_target(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.meta = object()
+    player.duration = 10.0
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._on_scrub_preview(2.0)
+    old = player.pending.pop(0)
+    w._on_scrub_preview(3.0)
+    w._transport._preview_started -= 3.0
+    w._on_ui_tick()
+    assert old.cancelled()
+    assert w._transport.preview_pending
+    assert w._transport._preview_target == pytest.approx(3.0)
+
+    w._on_ui_tick()  # deliver the stale completion
+    assert w._transport._preview_target == pytest.approx(3.0)
+    w._transport.cancel_pending_seeks()
+    w.timeline.release_preview()
+    w._loads.clear()
+    w._source_monitor.clear()
+
+
+def test_clear_sync_cancels_pending_seek(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.meta = object()
+    player.duration = 10.0
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._on_seek_committed(4.0)
+    exact = player.pending.pop(0)
+    w.timeline.preview_master(4.0)
+    assert w._transport.exact_seek_pending
+    assert w.timeline.preview_hold
+
+    w._clear_sync()
+    assert exact.cancelled()
+    assert not w._transport.exact_seek_pending
+    assert not w.timeline.preview_hold
+    assert w.statusBar().currentMessage() == "Sync cleared"
+    w._on_ui_tick()
+    assert not w._transport.exact_seek_pending
+
+
+def test_loading_follower_keeps_time_label_blank(qapp: QApplication, tmp_path: Path) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    path = tmp_path / "loading.mp4"
+    path.write_bytes(b"x")
+    w.open_video("b", path)
+    assert w.views["b"].loading
+
+    w._on_ui_tick()
+    assert w.views["b"]._time_label.text() == "--"
+    w._loads.clear()
+    w._source_monitor.clear()
+
+
+def test_reload_clears_timeline_duration_immediately(qapp: QApplication, tmp_path: Path) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "b")
+    assert w.timeline._dur["b"] == pytest.approx(10.0)
+    path = tmp_path / "reload.mp4"
+    path.write_bytes(b"x")
+    w.open_video("b", path)
+    assert w.views["b"].loading
+    assert w.timeline._dur["b"] is None
+    w._loads.clear()
+    w._source_monitor.clear()
+
+
+def test_failed_load_returns_to_placeholder(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("vcplayer.ui.main_window.QMessageBox.warning", lambda *a, **k: None)
+    w = make_window(qapp, n=2)
+    path = tmp_path / "bad.mp4"
+    path.write_bytes(b"x")
+    w.open_video("a", path)
+    w._on_load_failed("a", path, "bad file")
+    view = w.views["a"]
+    assert not view.loading
+    assert view._stack.currentWidget() is view._placeholder
+    assert view.btn_play.isEnabled()
+    assert "load failed" in w.statusBar().currentMessage()
+    w._load_failures.clear()
+    w._showing_load_failure = False
+    w._loads.clear()
+    w._source_monitor.clear()
+
+
+def test_new_preview_cancels_pending_exact(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    player = SlowFakePlayer()
+    player.meta = object()
+    player.duration = 10.0
+    player.time_pos = 0.0
+    w.views["a"].surface._player = player  # type: ignore[assignment]
+
+    w._on_seek_committed(4.0)
+    exact_future = player.pending.pop(0)
+    assert not exact_future.cancelled()
+    w._on_scrub_preview(2.0)
+    assert exact_future.cancelled()
+    assert not w._transport.exact_seek_pending
+    assert player.fast_async == [2.0]
+    assert w.timeline._t["a"] == pytest.approx(2.0)
+    w._transport.cancel_pending_seeks()
+    w.timeline.release_preview()
+    w._loads.clear()
+    w._source_monitor.clear()
+
+
+def test_loading_status_survives_reference_promotion(qapp: QApplication, tmp_path: Path) -> None:
+    w = make_window(qapp, n=2)
+    path = tmp_path / "opening.mp4"
+    path.write_bytes(b"x")
+    w.open_video("a", path)
+    w._on_load_progress()
+    assert "opening opening.mp4" in w.statusBar().currentMessage()
+    w._on_ui_tick()
+    assert w._status_live.text() == "A: opening…"
+    w._loads.clear()
+    w._source_monitor.clear()
 
 
 def test_stale_missing_event_is_ignored(qapp: QApplication) -> None:
@@ -599,6 +1037,7 @@ def test_single_loaded_view_transport_works_for_all_presets(qapp: QApplication) 
             assert p["a"].seeks[-1] == pytest.approx(10.0 - 1.0 / 60.0)
             w._goto_first()
             assert p["a"].seeks[-1] == 0.0
+            w._on_ui_tick()
 
 
 @pytest.mark.parametrize(("n", "vid"), [(2, "b"), (3, "c"), (4, "d")])
@@ -653,6 +1092,7 @@ def test_single_view_restarts_at_zero_after_eof(qapp: QApplication) -> None:
     assert not w._transport.playing
     assert not p["a"].is_playing
     w._toggle_play()
+    w._on_ui_tick()
     assert p["a"].seeks == [0.0]
     assert p["a"].is_playing
 
@@ -755,6 +1195,7 @@ def test_solo_view_at_eof_restarts_on_first_global_play(qapp: QApplication) -> N
     p["a"].is_playing = True
     assert not w._transport.playing
     w._toggle_play()
+    w._on_ui_tick()
     assert p["a"].seeks == [0.0]
     assert p["a"].is_playing
 
@@ -1358,13 +1799,15 @@ def test_removing_promoted_reference_promotes_survivor(qapp: QApplication) -> No
     w._on_ui_tick()  # must not raise KeyError
 
 
-def test_load_progress_pushes_duration_before_ready(qapp: QApplication) -> None:
+def test_load_progress_keeps_loading_duration_cleared(qapp: QApplication) -> None:
     w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
     p = _players(w)
     p["b"].duration = 10.0
-    p["b"]._loading = True
+    w.views["b"].set_loading("b.mp4")
     w._on_load_progress()
-    assert w.timeline._dur["b"] == 10.0
+    assert w.timeline._dur["b"] is None
 
 
 def test_empty_reference_promotes_first_loaded_view(qapp: QApplication) -> None:

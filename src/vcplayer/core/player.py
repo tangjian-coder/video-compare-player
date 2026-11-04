@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from concurrent.futures import Future
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -393,6 +394,20 @@ class PlayerController:
         target = self._seek_target(t)
         if target is not None and not self._terminated:
             self._mpv.command("seek", target, "absolute")
+
+    def seek_exact_async(self, t: float) -> Future[Any] | None:
+        """Queue a frame-exact seek without blocking the GUI thread."""
+        target = self._seek_target(t)
+        if target is None or self._terminated:
+            return None
+        return self._mpv.command_async("seek", target, "absolute", "exact")
+
+    def seek_fast_async(self, t: float) -> Future[Any] | None:
+        """Queue a keyframe seek without blocking the GUI thread."""
+        target = self._seek_target(t)
+        if target is None or self._terminated:
+            return None
+        return self._mpv.command_async("seek", target, "absolute")
 
     def step_frames(self, frames: int) -> None:
         """Pause and step N frames on this view's own timeline (clamped)."""

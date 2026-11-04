@@ -333,6 +333,15 @@ QLabel#placeholderHint {
     color: #5c6166;
     font-size: 9pt;
 }
+QProgressBar#loadingBar {
+    background: rgba(255, 255, 255, 18);
+    border: none;
+    border-radius: 2px;
+}
+QProgressBar#loadingBar::chunk {
+    background: #0a84ff;
+    border-radius: 2px;
+}
 QLabel#timeLabel {
     color: #8e8e93;
     font-family: "Cascadia Mono", Consolas, monospace;

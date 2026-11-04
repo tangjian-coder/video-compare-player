@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QStackedLayout,
@@ -597,6 +598,7 @@ class VideoView(QFrame):
         self._playing_icon_state: bool | None = None
         self._loaded_name: str | None = None
         self._source_missing = False
+        self._loading = False
         self._hovered = False
         self.setProperty("trackHover", "")
         self.setProperty("activePane", "")
@@ -629,7 +631,7 @@ class VideoView(QFrame):
         header.addWidget(self._grip)
         self._drop_zone_name: str | None = None
 
-        self._placeholder = _PlaceholderPane()
+        self._placeholder = _PlaceholderPane(self)
         placeholder_layout = QVBoxLayout(self._placeholder)
         placeholder_layout.setContentsMargins(24, 24, 24, 24)
         placeholder_layout.setSpacing(6)
@@ -651,10 +653,34 @@ class VideoView(QFrame):
         placeholder_drag.setAlignment(Qt.AlignmentFlag.AlignCenter)
         placeholder_layout.addWidget(placeholder_drag)
         placeholder_layout.addStretch(1)
+
+        self._loading_page = _PlaceholderPane(self)
+        loading_layout = QVBoxLayout(self._loading_page)
+        loading_layout.setContentsMargins(24, 24, 24, 24)
+        loading_layout.setSpacing(8)
+        loading_layout.addStretch(1)
+        loading_title = QLabel("Opening video…")
+        loading_title.setObjectName("placeholderTitle")
+        loading_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_layout.addWidget(loading_title)
+        self._loading_name = _ElidedLabel("")
+        self._loading_name.setObjectName("placeholderHint")
+        self._loading_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_layout.addWidget(self._loading_name)
+        self._loading_bar = QProgressBar()
+        self._loading_bar.setObjectName("loadingBar")
+        self._loading_bar.setRange(0, 0)
+        self._loading_bar.setTextVisible(False)
+        self._loading_bar.setFixedHeight(4)
+        self._loading_bar.setFixedWidth(180)
+        loading_layout.addWidget(self._loading_bar, alignment=Qt.AlignmentFlag.AlignCenter)
+        loading_layout.addStretch(1)
+
         self.surface = MpvSurface(self)
         self.surface.installEventFilter(self)
         self._stack = QStackedLayout()
         self._stack.addWidget(self._placeholder)
+        self._stack.addWidget(self._loading_page)
         self._stack.addWidget(self.surface)
 
         self.btn_step_back = QPushButton()
@@ -823,15 +849,35 @@ class VideoView(QFrame):
         """Create the underlying mpv player (idempotent)."""
         return self.surface.ensure_player()
 
+    def set_loading(self, name: str) -> None:
+        """Show immediate load feedback while metadata is still pending."""
+        self._loaded_name = name
+        self._source_missing = False
+        self._loading = True
+        self._render_source_label()
+        self._loading_name.setText(name)
+        self._stack.setCurrentWidget(self._loading_page)
+        self.surface.hide()
+        self.btn_clear.setVisible(True)
+        self._time_label.setText("--")
+        self._playing_icon_state = None
+        self.set_play_text(False)
+
     def set_loaded_name(self, name: str) -> None:
         """Show the loaded file name and switch from placeholder to video."""
         self._loaded_name = name
         self._source_missing = False
+        self._loading = False
         self._render_source_label()
         self._stack.setCurrentWidget(self.surface)
         self.btn_clear.setVisible(True)
         if self._hovered:  # pointer stayed on the pane across clear/reload
             self.hover_changed.emit(self.view_id, True)
+
+    @property
+    def loading(self) -> bool:
+        """True while the player is opening a file but metadata is not ready."""
+        return self._loading
 
     @property
     def source_missing(self) -> bool:
@@ -869,6 +915,7 @@ class VideoView(QFrame):
         """Return to the empty placeholder after the player unloads."""
         self._loaded_name = None
         self._source_missing = False
+        self._loading = False
         self._caption.setText("no video")
         self._caption.setToolTip("")
         self._header.set_title(f"View {self.view_name}")
@@ -887,7 +934,8 @@ class VideoView(QFrame):
 
     def set_time_text(self, text: str) -> None:
         """Update the per-view time readout."""
-        self._time_label.setText(text)
+        if self._time_label.text() != text:
+            self._time_label.setText(text)
 
     def set_play_text(self, playing: bool) -> None:
         """Update the per-view play/pause button icon and tooltip."""

@@ -13,7 +13,8 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterable
-from typing import Literal, Protocol
+from concurrent.futures import Future
+from typing import Any, Literal, Protocol
 
 from .models import SyncState
 
@@ -27,6 +28,13 @@ _EWMA_ALPHA = 0.3  # smoothing factor for drift readings
 _MAX_NUDGE = 0.10  # speed correction limit (+/- 10%)
 _FULL_NUDGE_DRIFT = 0.03  # drift (s) that saturates the nudge
 _SPEED_WRITE_EPS = 0.005  # minimum meaningful speed change to write
+
+
+def _completed_future() -> Future[Any]:
+    future: Future[Any] = Future()
+    future.set_result(None)
+    return future
+
 
 # resync_if_needed() gate: drift beyond this many reference frames gets a
 # corrective seek; smaller residuals are converged by the speed loop.
@@ -165,7 +173,30 @@ class SyncEngine:
         else:
             self.b.seek_fast(target)
 
-    def force_resync(self) -> None:
+    def follower_target(self, master: float) -> float:
+        """Map a master time to the follower's clamped local time."""
+        target = master + self.offset
+        dur_b = self.b.duration
+        if dur_b is not None:
+            target = min(max(target, 0.0), dur_b)
+        return target
+
+    def seek_follower_async(self, master: float, *, exact: bool = True) -> Future[Any]:
+        """Queue the follower seek; synchronous fakes complete immediately."""
+        target = self.follower_target(master)
+        method_name = "seek_exact_async" if exact else "seek_fast_async"
+        method = getattr(self.b, method_name, None)
+        if callable(method):
+            future = method(target)
+            if future is not None:
+                return future
+        if exact:
+            self.b.seek_exact(target)
+        else:
+            self.b.seek_fast(target)
+        return _completed_future()
+
+    def force_resync(self, *, async_seek: bool = True) -> None:
         """Hard-align B onto A's aligned time right now.
 
         The follower's target is clamped to its own stream: when the reference
@@ -176,11 +207,14 @@ class SyncEngine:
         dur_b = self.b.duration
         if dur_b is not None:
             target = min(max(target, 0.0), dur_b)
-        self.b.seek_exact(target)
+        method = getattr(self.b, "seek_exact_async", None)
+        future = method(target) if async_seek and callable(method) else None
+        if future is None:
+            self.b.seek_exact(target)
         self.reset_runtime()  # EWMA belongs to the pre-seek position
         logger.info("force resync: b -> %.3f (offset %+.3f)", target, self.offset)
 
-    def resync_if_needed(self) -> bool:
+    def resync_if_needed(self, *, async_seek: bool = True) -> bool:
         """Hard-align B onto A only when drift exceeds the frame gate.
 
         Returns True when a corrective seek was issued. An unconditional
@@ -192,7 +226,7 @@ class SyncEngine:
         drift = self.drift()
         if drift is None or abs(drift) <= _RESYNC_DRIFT_FRAMES / self.reference_fps:
             return False
-        self.force_resync()
+        self.force_resync(async_seek=async_seek)
         return True
 
     # -- drift handling ---------------------------------------------------------

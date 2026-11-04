@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import perf
 from .config import ASSETS_DIR, VENDOR_DIR, AppConfig
 
 if TYPE_CHECKING:
@@ -91,6 +92,7 @@ def _set_app_user_model_id() -> None:
 
 def run(videos: Sequence[Path] | None = None) -> int:
     """Create the Qt application and enter the event loop."""
+    started = perf.process_start()
     _prepare_libmpv_path()
     _prepare_timer_resolution()
     _set_app_user_model_id()
@@ -102,16 +104,25 @@ def run(videos: Sequence[Path] | None = None) -> int:
     from .ui.style import apply_app_style
 
     app = QApplication(sys.argv)
+    perf.mark("startup.qt_ready", started)
     app.setApplicationName("video-compare-player")
     _load_bundled_fonts()
+    perf.mark("startup.fonts", started)
     _apply_window_icon(app)
+    perf.mark("startup.icon", started)
     apply_app_style(app)
+    perf.mark("startup.style", started)
 
     config = AppConfig.load()
+    perf.mark("startup.config", started)
     window = MainWindow(config)
+    perf.mark("startup.window_created", started)
     window.show()
+    perf.mark("startup.window_shown", started)
     # Players need native windows, so initialize after show().
     QTimer.singleShot(0, lambda: window.initialize(videos=list(videos or [])))
 
     logger.info("entering Qt event loop")
+    perf.mark("startup.event_loop", started)
+    QTimer.singleShot(0, lambda: perf.mark("startup.first_tick", started))
     return app.exec()

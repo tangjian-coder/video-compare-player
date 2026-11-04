@@ -25,7 +25,16 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["imageio_ffmpeg"],
+    excludes=[
+        "imageio_ffmpeg",
+        "PIL",
+        "PySide6.QtNetwork",
+        "PySide6.QtPdf",
+        "PySide6.QtQml",
+        "PySide6.QtQuick",
+        "PySide6.QtSvg",
+        "PySide6.QtVirtualKeyboard",
+    ],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

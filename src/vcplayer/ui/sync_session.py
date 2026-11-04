@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future
+from dataclasses import dataclass
+from typing import Any
 
 from ..core.player import PlayerController
 from ..core.sync import (
@@ -14,6 +17,21 @@ from ..core.sync import (
     player_frame_rate,
 )
 from .video_view import VideoView
+
+
+def _completed_future() -> Future[Any]:
+    future: Future[Any] = Future()
+    future.set_result(None)
+    return future
+
+
+@dataclass(frozen=True)
+class AsyncSeek:
+    """One player seek queued by a group operation."""
+
+    view: ViewId
+    future: Future[Any]
+    target: float
 
 
 class SyncSession:
@@ -135,6 +153,35 @@ class SyncSession:
                 # A hard seek invalidates the EWMA the loop was built on.
                 eng.reset_runtime()
         return True
+
+    def seek_master_all_async(self, master: float, *, exact: bool = True) -> list[AsyncSeek] | None:
+        """Queue one seek per player; return futures and local targets."""
+        rng = self.playable_range()
+        if rng is None:
+            return None
+        master = min(max(master, rng[0]), rng[1])
+        seeks: list[AsyncSeek] = []
+        player = self.master_player
+        method = getattr(player, "seek_exact_async" if exact else "seek_fast_async", None)
+        if callable(method):
+            future = method(master)
+            if future is None:
+                return None
+            seeks.append(AsyncSeek(self.master, future, master))
+        else:
+            if exact:
+                player.seek_exact(master)
+            else:
+                player.seek_fast(master)
+            seeks.append(AsyncSeek(self.master, _completed_future(), master))
+        for vid, eng in self.engines.items():
+            if eng.ready:
+                target = eng.follower_target(master)
+                future = eng.seek_follower_async(master, exact=exact)
+                seeks.append(AsyncSeek(vid, future, target))
+                # A hard seek invalidates the EWMA the loop was built on.
+                eng.reset_runtime()
+        return seeks or None
 
     def current_anchors(self) -> dict[ViewId, float | None]:
         anchors: dict[ViewId, float | None] = {self.master: None}

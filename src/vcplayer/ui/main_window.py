@@ -13,6 +13,7 @@ import logging
 import os
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import cast
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import perf
 from ..config import AppConfig
 from ..core import recorder as rec
 from ..core.player import PlayerError
@@ -41,6 +43,7 @@ from . import layout as pane_layout
 from .icons import make_icon
 from .load_coordinator import LoadCoordinator
 from .pane_drag import VIDEO_EXTS
+from .perf_monitor import UiStallMonitor
 from .recording_controller import RecordingController
 from .session_controller import SessionController
 from .source_monitor import SourceMonitor
@@ -60,8 +63,10 @@ from .win_chrome import apply_dark_title_bar
 logger = logging.getLogger(__name__)
 
 SPEED_STEPS = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0]
-UI_TICK_MS = 15  # ~66 Hz so the playhead tracks high-fps video smoothly
+UI_TICK_MS = 16  # ~60 Hz so the playhead tracks high-fps video smoothly
+IDLE_TICK_MS = 100
 DRIFT_TICK_MS = 100
+STATUS_INTERVAL_S = 0.05
 
 MIN_VIEWS = 1
 MAX_VIEWS = pane_layout.MAX_VIEWS
@@ -72,12 +77,14 @@ class MainWindow(QMainWindow):
     """Top-level window assembling views, transport, timeline and sync logic."""
 
     def __init__(self, config: AppConfig) -> None:
+        section_start = perf.begin()
         super().__init__()
         self.config = config
         self.setWindowTitle("video-compare-player")
         self.resize(config.window.width, config.window.height)
 
         self._session = SessionController([VideoView("A"), VideoView("B")])
+        perf.mark("ui.session", section_start)
         self._initialized = False
         # Row-list pane arrangement; ViewHost only moves widgets inside its
         # own grid (never reparents: the mpv surfaces are native windows).
@@ -93,10 +100,12 @@ class MainWindow(QMainWindow):
         self.view_host = ViewHost()
         self.view_host.apply_layout(self._layout, self.views)
         self._rec_controller = RecordingController(self, self.view_host, self)
+        perf.mark("ui.host", section_start)
 
         self.timeline = TimelineWidget()
         self.timeline.setObjectName("timeline")
         self.timeline.set_tracks(self.view_ids)
+        perf.mark("ui.timeline", section_start)
 
         self.btn_first = self._icon_button("skip-start", "Go to start (Home)")
         self.btn_step_back = self._icon_button("step-back", "Step all views back one frame (←)")
@@ -202,6 +211,7 @@ class MainWindow(QMainWindow):
             self.btn_crosshair,
         ):
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        perf.mark("ui.toolbar", section_start)
 
         transport_bar = QFrame()
         transport_bar.setObjectName("transportBar")
@@ -236,6 +246,7 @@ class MainWindow(QMainWindow):
         right_group.addWidget(self.btn_rec)
         right_group.addWidget(self.btn_crosshair)
         transport.addLayout(right_group)
+        perf.mark("ui.transport", section_start)
 
         central = QWidget()
         central.setObjectName("centralContainer")
@@ -246,9 +257,11 @@ class MainWindow(QMainWindow):
         vbox.addWidget(self.timeline)
         vbox.addWidget(transport_bar)
         self.setCentralWidget(central)
+        perf.mark("ui.central", section_start)
 
         self._active_view = "a"
         self._loads = LoadCoordinator(self)
+        self._load_started: dict[ViewId, float] = {}
         self._source_monitor = SourceMonitor(self)
         self._source_monitor.missing.connect(self._on_source_missing)
         self._load_failures: list[str] = []
@@ -257,11 +270,16 @@ class MainWindow(QMainWindow):
         # Playhead smoothing state: interpolate between mpv frame updates.
         self._playhead = PlayheadSmoother()
         self._play_icon_state: bool | None = None
+        self._last_status_at = 0.0
+        self._last_status_text = ""
+        self._last_status_tooltip = ""
+        self._seek_commit_started: float | None = None
+        self._ui_fast_until = 0.0
         self._closing = False
         self._drift_tick_count = 0
         # Live readout lives in a permanent widget: showMessage() stays free
         # for event messages ("Synced: ..."), which would otherwise be
-        # clobbered by the 15 ms UI tick.
+        # clobbered by the high-rate UI tick.
         self._status_live = QLabel("")
         self._status_live.setObjectName("statusLive")
         self.statusBar().addPermanentWidget(self._status_live)
@@ -270,6 +288,7 @@ class MainWindow(QMainWindow):
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._on_ui_tick)
+        self._ui_stall = UiStallMonitor(self)
         self._drift_timer = QTimer(self)
         self._drift_timer.timeout.connect(self._on_drift_tick)
         self._loads.loaded.connect(self._on_video_loaded)
@@ -278,6 +297,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_view_buttons()
         self._set_active_view("a")
+        perf.mark("ui.ready", section_start)
 
     @property
     def views(self) -> dict[ViewId, VideoView]:
@@ -354,6 +374,7 @@ class MainWindow(QMainWindow):
 
         self._ui_timer.start(UI_TICK_MS)
         self._drift_timer.start(DRIFT_TICK_MS)
+        self._ui_stall.start()
 
         # Apply persisted playback speed through the combo's sanitized
         # value: mpv defaults to 1.0x regardless of the combo box, and a
@@ -377,11 +398,13 @@ class MainWindow(QMainWindow):
         for path in videos[2:]:
             if path is not None:
                 self._add_view(load=path)
-        self.statusBar().showMessage("Drop a video into each block to compare")
+        if not videos:
+            self.statusBar().showMessage("Drop a video into each block to compare")
         # Warm the recorder's ffmpeg probe cache in the background so
         # the first Rec click starts instantly instead of paying ~1s
         # of probe latency (subprocesses never touch the GIL).
         threading.Thread(target=rec.warm_up_probe, daemon=True).start()
+        perf.mark("startup.initialized")
         logger.info("main window initialized")
 
     def _wire_view(self, view: VideoView, view_id: ViewId) -> None:
@@ -498,7 +521,9 @@ class MainWindow(QMainWindow):
         self._closing = True
         self._ui_timer.stop()
         self._drift_timer.stop()
+        self._ui_stall.stop()
         self._transport.playing = False
+        self._transport.cancel_pending_seeks()
         self._loads.clear()
         self._source_monitor.clear()
         self._reset_hover()
@@ -643,7 +668,10 @@ class MainWindow(QMainWindow):
 
     def _destroy_view(self, vid: ViewId, *, replacement: ViewId | None = None) -> None:
         """Remove a view from state and life (player released)."""
+        self._transport.cancel_pending_seeks()
+        self.timeline.release_preview()
         self._loads.cancel(vid)
+        self._load_started.pop(vid, None)
         self._source_monitor.forget(vid)
         view = self._session.pop_view(vid, replacement=replacement)
         if view is not None:
@@ -817,9 +845,10 @@ class MainWindow(QMainWindow):
             else "Arrange panes, or switch to Single and unload the other views"
         )
         self._clear_all_action.setEnabled(can_edit)
-        playable = not self._session.has_missing_source
+        blocked = self._session.has_missing_source
         for view in self.views.values():
             view.btn_clear.setEnabled(can_edit)
+            playable = not blocked and not view.loading
             view.btn_play.setEnabled(playable)
             view.btn_step_back.setEnabled(playable)
             view.btn_step_fwd.setEnabled(playable)
@@ -846,7 +875,8 @@ class MainWindow(QMainWindow):
         self._transport.reset_speeds()
         self._refresh_sync_ui()
         logger.info("reference promoted to view %s", promoted)
-        self.statusBar().showMessage(f"{promoted.upper()} is now the reference")
+        if not self.views[promoted].loading:
+            self.statusBar().showMessage(f"{promoted.upper()} is now the reference")
 
     def _clear_view_video(self, view: str) -> None:
         """Unload one pane's video and return it to the empty placeholder."""
@@ -859,7 +889,10 @@ class MainWindow(QMainWindow):
         # view: the transport needs a master player and old anchors are void.
         new_master = self._reference_candidate(vid) if vid == self._session.master else None
         self._stop_playback()
+        self._transport.cancel_pending_seeks()
+        self.timeline.release_preview()
         self._loads.cancel(vid)
+        self._load_started.pop(vid, None)
         self._source_monitor.forget(vid)
         pane = self.views[vid]
         try:
@@ -892,7 +925,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("No videos to clear")
             return
         self._stop_playback()
+        self._transport.cancel_pending_seeks()
+        self.timeline.release_preview()
         self._loads.clear()
+        self._load_started.clear()
         self._source_monitor.clear()
         for vid in self.view_ids:
             pane = self.views[vid]
@@ -919,9 +955,8 @@ class MainWindow(QMainWindow):
         durs: dict[ViewId, float | None] = {}
         for vid in self.view_ids:
             pane = self.views[vid]
-            # A cleared/failed pane stays dead even if mpv still reports a
-            # stale duration from the previous file.
-            if pane.player.is_loading or pane.player.is_ready:
+            # A loading/cleared/failed pane must not expose a stale duration.
+            if not pane.loading and (pane.player.is_loading or pane.player.is_ready):
                 durs[vid] = pane.player.duration
             else:
                 durs[vid] = None
@@ -931,7 +966,10 @@ class MainWindow(QMainWindow):
         """Load a video into one of the views."""
         if view not in self.views or not self._guard_edit("opening videos"):
             return
+        started = perf.begin()
         self._stop_playback()
+        self._transport.cancel_pending_seeks()
+        self.timeline.release_preview()
         try:
             self.views[view].player.load(path)
         except PlayerError as exc:
@@ -940,15 +978,21 @@ class MainWindow(QMainWindow):
         # Only a successfully accepted load stops watching the old source.
         self._source_monitor.forget(view)
         self.views[view].set_source_missing(False)
+        self.views[view].set_loading(path.name)
+        self._load_started[view] = started
+        self._refresh_view_buttons()
+        self._push_timeline_durations()
         # A failed dialog/file pick leaves the current session untouched.
         # (A reload of A breaks every pair, a follower only its own.)
         self._invalidate_sync(view)
         self._loads.start(view, path, self.views[view].player)
         self.config.last_dir = str(path.parent)
+        self.statusBar().showMessage(f"{view.upper()}: opening {path.name}…")
+        perf.mark("load.requested", view=view, file=path.name)
         logger.info("view %s <- %s", view, path)
 
     def _on_load_progress(self) -> None:
-        """Keep durations/reference current while a load is still demuxing."""
+        """Keep timeline durations and reference promotion current during loading."""
         if not self._initialized or self._closing:
             return
         self._push_timeline_durations()
@@ -966,6 +1010,7 @@ class MainWindow(QMainWindow):
         name = source.name
         view.set_loaded_name(name)
         self._source_monitor.track(vid, source)
+        perf.mark("load.ready", self._load_started.pop(vid, None), view=vid, file=name)
         self._notify(f"{vid.upper()}: {name} loaded")
         self._push_timeline_durations()
         self._ensure_reference()
@@ -982,6 +1027,8 @@ class MainWindow(QMainWindow):
         view = self.views.get(vid)
         if view is None or not view.player.is_ready:
             return
+        self._transport.cancel_pending_seeks()
+        self.timeline.release_preview()
         self._transport.stop()
         view.player.pause()
         view.set_source_missing(True)
@@ -1000,8 +1047,10 @@ class MainWindow(QMainWindow):
         view = self.views.get(vid)
         if view is not None:
             view.clear_loaded()
+        perf.mark("load.failed", self._load_started.pop(vid, None), view=vid)
         self._push_timeline_durations()
         self._ensure_reference()
+        self.statusBar().showMessage(f"{vid.upper()}: load failed")
         self._refresh_view_buttons()
         logger.warning("view %s failed to load %s", vid, path)
         self._queue_load_failure(message)
@@ -1031,38 +1080,74 @@ class MainWindow(QMainWindow):
 
     def _toggle_play(self) -> None:
         self._transport.toggle()
+        self._update_ui_rate()
 
     def _stop_playback(self) -> None:
         self._transport.stop()
+        self._update_ui_rate()
 
     def _resync_if_needed(self) -> None:
         if not self._closing:
             self._transport.resync_if_needed()
 
     def _step(self, frames: int) -> None:
+        started = perf.begin()
         self._transport.step(frames)
+        if self._transport.exact_seek_pending:
+            self._seek_commit_started = started
+        self._update_ui_rate()
 
     def _step_view(self, view: ViewId, frames: int) -> None:
         """Step one view independently (used to find the sync frame)."""
-        self._transport.step_view(view, frames)
+        if self._transport.step_view(view, frames):
+            self._ui_fast_until = time.monotonic() + 0.25
+            self._update_ui_rate()
+            self._on_ui_tick()
 
     def _toggle_play_view(self, view: ViewId) -> None:
         """Play/pause one view alone, for hunting the sync frame."""
         self._transport.toggle_view(view)
+        self._update_ui_rate()
 
     def _goto_first(self) -> None:
+        started = perf.begin()
         self._transport.goto_first()
+        if self._transport.exact_seek_pending:
+            self._seek_commit_started = started
+        self._update_ui_rate()
 
     def _goto_last(self) -> None:
+        started = perf.begin()
         self._transport.goto_last()
+        if self._transport.exact_seek_pending:
+            self._seek_commit_started = started
+        self._update_ui_rate()
+
+    def _clamp_master_time(self, t: float) -> float:
+        rng = self._transport.playable_range()
+        return t if rng is None else min(max(t, rng[0]), rng[1])
 
     def _on_scrub_preview(self, t: float) -> None:
-        """Coarse seek while dragging; stops playback so they don't fight."""
-        self._transport.scrub_preview(t)
+        """Coarse seek while dragging; move the knobs before mpv catches up."""
+        target = self._clamp_master_time(t)
+        if self._transport.scrub_preview(target):
+            self.timeline.preview_master(target)
+            self._update_ui_rate()
+        else:
+            self.timeline.release_preview()
 
     def _on_seek_committed(self, t: float) -> None:
         """Exact seek on mouse release."""
-        self._transport.seek_committed(t)
+        started = perf.begin()
+        target = self._clamp_master_time(t)
+        if self._transport.seek_committed(target):
+            self.timeline.preview_master(target)
+            self._seek_commit_started = started
+        else:
+            self.timeline.release_preview()
+            self._seek_commit_started = None
+        perf.mark("seek.commit.requested", started)
+        self._update_ui_rate()
 
     def _on_speed_changed(self, index: int) -> None:
         speed = float(self.speed_combo.itemData(index))
@@ -1104,6 +1189,9 @@ class MainWindow(QMainWindow):
         if self._session.has_missing_source:
             self.statusBar().showMessage("Reload or clear the missing source first")
             return
+        if self._transport.exact_seek_pending or self._transport.preview_pending:
+            self.statusBar().showMessage("Wait for the current seek to finish")
+            return
         if not self._transport.any_engine_ready():
             if len(self.view_ids) == MIN_VIEWS:
                 message = (
@@ -1121,11 +1209,16 @@ class MainWindow(QMainWindow):
             logger.warning("align failed: %s", error)
             self.statusBar().showMessage(f"Cannot sync: {error or 'no pair ready'}")
             return
+        self._refresh_sync_ui()
         rng = self._transport.playable_range()
         master = self.views[self._session.master].player.time_pos
         if rng is not None and master is not None:
-            self._seek_master_all(min(max(master, rng[0]), rng[1]))
-        self._refresh_sync_ui()
+            target = min(max(master, rng[0]), rng[1])
+            started = perf.begin()
+            if self._transport.seek_committed(target):
+                self.timeline.preview_master(target)
+                self._seek_commit_started = started
+                self._update_ui_rate()
         parts = [format_pair(self._session.master, vid, off) for vid, off in offsets.items()]
         message = "Synced: " + " · ".join(parts)
         if error:
@@ -1142,6 +1235,8 @@ class MainWindow(QMainWindow):
         if not self._initialized:
             return
         self._stop_playback()
+        self._transport.cancel_pending_seeks()
+        self.timeline.release_preview()
         self._session.clear_sync()
         # Undo any ±10% regulate nudge: without an anchor the loop stops
         # correcting, so a nudged follower would otherwise keep that speed.
@@ -1234,9 +1329,45 @@ class MainWindow(QMainWindow):
 
     # -- timers ------------------------------------------------------------------
 
+    def _update_ui_rate(self) -> None:
+        """Use the high-rate timer only while motion or seeks are pending."""
+        fast = (
+            self._transport.playing
+            or self._transport.any_player_playing()
+            or self._transport.exact_seek_pending
+            or self._transport.preview_pending
+            or time.monotonic() < self._ui_fast_until
+        )
+        interval = UI_TICK_MS if fast else IDLE_TICK_MS
+        if self._ui_timer.interval() != interval:
+            self._ui_timer.setInterval(interval)
+
     def _on_ui_tick(self) -> None:
         if not self._initialized or self._closing:
             return
+        if self._transport.poll_seek_completions():
+            if not self._transport.preview_pending and not self.timeline.dragging:
+                self.timeline.release_preview()
+            perf.mark("seek.exact", self._seek_commit_started)
+            self._seek_commit_started = None
+        if (
+            self.timeline.preview_hold
+            and self._transport.any_player_playing()
+            and not self._transport.exact_seek_pending
+        ):
+            self.timeline.release_preview()
+        if (
+            self.timeline.preview_hold
+            and not self._transport.exact_seek_pending
+            and not self._transport.preview_pending
+            and (
+                not self.timeline.dragging
+                and self.timeline.preview_idle_seconds() > 1.5
+                or self.timeline.dragging
+                and self.timeline.preview_idle_seconds() > 5.0
+            )
+        ):
+            self.timeline.release_preview()
         # Recording elapsed time on the Rec button (once per second) runs
         # before the engine guard: recording works without loaded videos.
         # Only while truly RECORDING: in STOPPING the "finishing…" label
@@ -1251,8 +1382,11 @@ class MainWindow(QMainWindow):
             if self._session.master not in self.views:
                 return
         self._transport.reconcile()
-        master_player = self.views[self._session.master].player
-        master = master_player.time_pos
+        master_id = self._session.master
+        master_view = self.views[master_id]
+        master_player = master_view.player
+        master = None if master_view.loading else master_player.time_pos
+        master_label = master
         shown: float | None = None
         if master is not None:
             # Follow each player's real state, not the global sync flag: a
@@ -1268,49 +1402,72 @@ class MainWindow(QMainWindow):
                 self.config.speed,
                 master_player.duration,
             )
-        # Each knob shows its own video's actual local time (so solo
-        # playback moves only that track); the mapped position is a
-        # fallback while a follower is mid-load and reports no time yet.
-        # Follower readouts keep updating even when the reference is empty.
-        heads: dict[ViewId, float] = {} if shown is None else {self._session.master: shown}
+        # Read each player once per tick and reuse the values for the knobs
+        # and the per-view time labels.
+        label_times: dict[ViewId, float] = {}
+        if master_label is not None and not master_view.loading:
+            label_times[master_id] = master_label
+        heads: dict[ViewId, float] = {} if shown is None else {master_id: shown}
         for vid in self.view_ids:
-            if vid == self._session.master:
+            if vid == master_id:
                 continue
-            p = self.views[vid].player
-            t = p.playback_time
+            pane = self.views[vid]
+            p = pane.player
+            raw = None if pane.loading else p.time_pos
+            t = None if pane.loading else p.playback_time
             if t is None:
-                t = p.time_pos
+                t = raw
             if t is None and shown is not None:
-                t = self._session.view_time(vid, shown, self._session.master)
+                t = self._session.view_time(vid, shown, master_id)
             if t is None:
                 continue
             dur = p.duration
             if dur is not None:
                 t = min(t, dur)
             heads[vid] = t
+            if raw is not None and not self.views[vid].loading:
+                label_times[vid] = raw
         if heads:
             self.timeline.set_playheads(heads)
         for vid in self.view_ids:
-            self._update_view_time(self.views[vid])
+            self._update_view_time(self.views[vid], label_times.get(vid))
             self.views[vid].set_play_text(self.views[vid].player.is_playing)
-        if shown is not None:
+        now = time.monotonic()
+        if shown is not None and not master_view.loading:
             assert master is not None
-            readout = format_live_status(
-                master,
-                self._session.current_offsets(),
-                self._session.drifts(),
-                self._transport.reference_fps(),
-                self._session.master,
-            )
-            self._status_live.setText(readout.text)
-            self._status_live.setToolTip(readout.tooltip)
+            if now - self._last_status_at >= STATUS_INTERVAL_S:
+                readout = format_live_status(
+                    master,
+                    self._session.current_offsets(),
+                    self._session.drifts(),
+                    self._transport.reference_fps(),
+                    master_id,
+                )
+                if readout.text != self._last_status_text:
+                    self._status_live.setText(readout.text)
+                    self._last_status_text = readout.text
+                if readout.tooltip != self._last_status_tooltip:
+                    self._status_live.setToolTip(readout.tooltip)
+                    self._last_status_tooltip = readout.tooltip
+                self._last_status_at = now
         else:
-            self._status_live.setText(f"{self._session.master.upper()} not loaded")
+            master_view = self.views[master_id]
+            text = (
+                f"{master_id.upper()}: opening…"
+                if master_view.loading
+                else f"{master_id.upper()} not loaded"
+            )
+            if text != self._last_status_text:
+                self._status_live.setText(text)
+                self._last_status_text = text
+            if self._last_status_tooltip:
+                self._status_live.setToolTip("")
+                self._last_status_tooltip = ""
         self._set_play_icon(self._transport.effective_playing())
+        self._update_ui_rate()
 
     @staticmethod
-    def _update_view_time(view: VideoView) -> None:
-        t = view.player.time_pos
+    def _update_view_time(view: VideoView, t: float | None) -> None:
         view.set_time_text(f"{t:.3f}s" if t is not None else "--")
 
     def _on_drift_tick(self) -> None:

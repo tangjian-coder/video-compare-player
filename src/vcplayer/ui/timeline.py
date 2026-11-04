@@ -101,6 +101,8 @@ class TimelineWidget(QWidget):
         self._drag_view: ViewId | None = None
         self._hover_view: ViewId | None = None
         self._last_preview = 0.0
+        self._preview_hold = False
+        self._last_preview_at = 0.0
 
     # -- state ----------------------------------------------------------------
 
@@ -145,6 +147,8 @@ class TimelineWidget(QWidget):
         if self._hover_view not in self._views:
             self._hover_view = None
         if self._drag_view not in self._views:
+            if self._drag_view is not None:
+                self._preview_hold = False
             self._drag_view = None
         for view in self._views:
             self._dur.setdefault(view, None)
@@ -171,6 +175,7 @@ class TimelineWidget(QWidget):
             self._set_hover(None)
         if self._drag_view is not None and not self._is_loaded(self._drag_view):
             self._drag_view = None
+            self.release_preview()
         self.update()
 
     def set_anchors(self, anchors: Mapping[ViewId, float | None]) -> None:
@@ -192,10 +197,49 @@ class TimelineWidget(QWidget):
 
     def set_playheads(self, times: Mapping[ViewId, float]) -> None:
         """Move the knobs (each in its own video's local time)."""
+        if self._preview_hold:
+            return
+        changed = False
         for view, t in times.items():
             if view not in self._views:
                 continue
-            self._t[view] = t
+            if self._t.get(view) != t:
+                self._t[view] = t
+                changed = True
+        if changed:
+            self.update()
+
+    @property
+    def preview_hold(self) -> bool:
+        return self._preview_hold
+
+    @property
+    def dragging(self) -> bool:
+        return self._drag_view is not None
+
+    def preview_idle_seconds(self) -> float:
+        return time.monotonic() - self._last_preview_at
+
+    def preview_master(self, master: float) -> None:
+        """Move every knob optimistically while the players catch up."""
+        self._preview_hold = True
+        self._last_preview_at = time.monotonic()
+        changed = False
+        for view in self._views:
+            local = master if view == self._master else master + self._offset(view)
+            duration = self._dur.get(view)
+            if duration is not None:
+                local = min(max(local, 0.0), duration)
+            if self._t.get(view) != local:
+                self._t[view] = local
+                changed = True
+        if changed:
+            self.update()
+
+    def release_preview(self) -> None:
+        """Resume normal playhead updates after the final seek settles."""
+        self._preview_hold = False
+        self._last_preview_at = 0.0
         self.update()
 
     @property

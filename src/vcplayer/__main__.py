@@ -8,6 +8,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from . import perf
 from .config import LOG_DIR
 from .ui.layout import MAX_VIEWS
 
@@ -50,11 +51,14 @@ def main(argv: list[str] | None = None) -> int:
         help="1-4 videos: first two fill views A/B, each extra adds a view",
     )
     parser.add_argument("--debug", action="store_true", help="enable debug logging")
+    parser.add_argument("--perf", action="store_true", help="log interaction performance")
     args = parser.parse_args(argv)
     if len(args.videos) > MAX_VIEWS:
         parser.error(f"at most {MAX_VIEWS} videos (one per view)")
 
     _setup_logging(args.debug)
+    perf.configure(args.perf or None)
+    perf.mark("startup.cli", perf.process_start())
     logger = logging.getLogger(__name__)
     logger.info("starting vcplayer")
 

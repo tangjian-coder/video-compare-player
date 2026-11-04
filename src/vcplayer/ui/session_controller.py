@@ -6,7 +6,7 @@ from collections.abc import Iterable
 
 from ..core.player import PlayerController
 from ..core.sync import SyncEngine, ViewId
-from .sync_session import SyncSession
+from .sync_session import AsyncSeek, SyncSession
 from .video_view import VideoView
 from .view_set import ViewSet
 
@@ -147,13 +147,16 @@ class SessionController:
     def seek_master_all(self, master: float, *, exact: bool = True) -> bool:
         return self._sync.seek_master_all(master, exact=exact)
 
+    def seek_master_all_async(self, master: float, *, exact: bool = True) -> list[AsyncSeek] | None:
+        return self._sync.seek_master_all_async(master, exact=exact)
+
     def align_current(self) -> tuple[dict[ViewId, float], str | None]:
         return self._sync.align_current()
 
-    def resync_ready(self) -> None:
+    def resync_ready(self, *, async_seek: bool = True) -> None:
         for eng in self.engines.values():
             if eng.ready and eng.state.is_complete:
-                eng.resync_if_needed()
+                eng.resync_if_needed(async_seek=async_seek)
 
     def view_time(self, view: ViewId, master: float, master_view: ViewId) -> float:
         eng = self.engines.get(view)

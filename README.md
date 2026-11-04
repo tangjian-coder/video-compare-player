@@ -2,11 +2,12 @@
 
 多视图视频同步对比播放器（1–4 视图动态切换）。为运动分析场景设计：**HLG/Dolby HDR、120fps 高帧率、高码率原片直接播放**（libmpv 硬件解码），无需预转码。
 
-当前版本：**v1.4.0**（2026-11-04）
+当前版本：**v1.4.1**（2026-11-04）
 
 ## 功能（v1.4）
 
 - **1–4 视图同步对比**：默认双视图，`＋` / `V` 键追加、`－` 移除（最多 4 块）；`Layout` → `Single (close others)` 只保留 A 并卸载其他窗格视频；布局预设只按当前视图数量显示，单视图时 `Layout` 禁用
+- **即时交互反馈**：视频打开立即显示 Opening 状态；时间轴拖动/点击先移动旋钮，异步 seek 不阻塞界面；暂停时自动降低 UI 刷新频率
 - **拖动标题栏自由排列窗格**：拖到另一窗格边缘＝插入该行/新行，拖到中心＝交换；4 视图默认 2×2，标题栏右键可选 1×4 / 2×2 / 3+1 等预设，也可重置布局
 - **清空视频**：每个窗格标题栏右侧 `×` 卸载该窗格视频；清空当前参考视图时自动把下一个已加载视图设为参考；`Open ▾` → `Clear all videos` 一键全清并清除同步
 - **源文件缺失检测**：播放中源文件被资源管理器删除或改名时，暂停全部视图并在窗格标记 `missing`；重新加载或清空该窗格前，播放/seek/Align 会被阻止
@@ -28,13 +29,17 @@
 .\.venv\Scripts\python.exe -m vcplayer a.mp4 b.mp4
 ```
 
-## 打包（单文件 exe）
+## 打包
 
 ```powershell
+# 默认：单文件版，便于分发
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
+
+# 可选：文件夹版
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -OneDir
 ```
 
-产出 `dist\vcplayer.exe`（约 130 MB，已内嵌 libmpv 与图标，版本号 **1.4.0**），发给别人**免安装直接双击**（Windows 10 1809+）。配置与日志写入 `%LOCALAPPDATA%\vcplayer\`。注意：exe 未签名，个别杀软可能误报需手动放行；单文件模式首启需解压，约 5–10 秒。
+默认产出 `dist\vcplayer.exe`（约 118 MB，已内嵌 libmpv 与图标，版本号 **1.4.1**）；`-OneDir` 产出 `dist\vcplayer\vcplayer.exe` 文件夹。单文件版每次启动需先解压，实际冷启动时间受文件系统和杀软扫描影响很大；`--perf` 从 Python 入口开始计时，不包含 PyInstaller 解压阶段。两者运行环境均为 Windows 10 1809+。配置与日志写入 `%LOCALAPPDATA%\vcplayer\`。exe 未签名，个别杀软可能误报需手动放行。固定到任务栏的 `.lnk` 建议运行 `scripts\set_aumid.py` 写入 AUMID，避免图标/分组退化。
 
 ## 界面布局
 
@@ -69,6 +74,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 .\.venv\Scripts\ruff.exe check src tests  # lint
 .\.venv\Scripts\mypy.exe                  # 类型检查
 .\.venv\Scripts\python.exe scripts\probe_decode.py  # 无头解码验证
+.\.venv\Scripts\python.exe -m vcplayer --perf      # 交互性能日志
 ```
 
 ## 结构
@@ -77,9 +83,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 src\vcplayer\
 ├── core\    models.py / player.py（libmpv 封装）/ sync.py（同步引擎）/ recorder.py（录屏）
 ├── ui\      main_window.py（组合根）/ session_controller.py（视图与参考策略）/ transport_controller.py（播放编排）/ load_coordinator.py（异步加载）/ source_monitor.py（源文件缺失监控）/ video_view.py（窗格+原生表面）/ view_host.py（网格布局）/ view_set.py（视图注册表）/ recording_controller.py（录屏会话）/ sync_session.py（同步会话）/ status_presenter.py（状态格式化）
-│            layout.py（纯布局模型）/ timeline.py（多轨时间轴）/ style.py + theme.py（主题）
+│            layout.py（纯布局模型）/ timeline.py（多轨时间轴）/ perf_monitor.py（UI 卡顿监控）/ style.py + theme.py（主题）
 │            icons.py（矢量图标）/ widgets.py / pane_drag.py（拖放编解码）/ win_chrome.py
-├── app.py / __main__.py / config.py
+├── app.py / __main__.py / config.py / perf.py
 tests\       core 纯逻辑 + 布局/时间轴数学 + offscreen UI 测试（FakePlayer，无真实 mpv）
 vendor\      libmpv-2.dll（mpv v0.41，硬解 + HDR）
 docs\        操作手册；2026-08-21 设计文档为 v1 历史背景
