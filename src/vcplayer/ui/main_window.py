@@ -148,13 +148,15 @@ class MainWindow(QMainWindow):
         self.btn_layout.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.btn_layout.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.btn_layout.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_layout.setToolTip("Arrange the panes (or drag a pane header)")
+        self.btn_layout.setToolTip("Arrange panes, or switch to Single and unload the other views")
         layout_menu = QMenu(self.btn_layout)
         layout_menu.aboutToShow.connect(lambda: self._populate_layout_menu(layout_menu))
         self.btn_layout.setMenu(layout_menu)
 
         self.btn_add = self._icon_button("plus", "Add another comparison view (V)")
-        self.btn_remove = self._icon_button("minus", "Remove the last view")
+        self.btn_remove = self._icon_button(
+            "minus", "Remove the most recently added view (unloads its video)"
+        )
         self.btn_align = QPushButton("Align")
         self.btn_align.setObjectName("alignButton")
         self.btn_align.setIcon(make_icon("swap", "#a9a7ff"))
@@ -445,14 +447,14 @@ class MainWindow(QMainWindow):
     def _populate_layout_menu(self, menu: QMenu) -> None:
         """(Re)build the layout menu; disabled while recording."""
         menu.clear()
+        menu.setToolTipsVisible(True)
         recording = self._recording()
         reset = menu.addAction("Reset layout")
         reset.triggered.connect(self._reset_layout)
         reset.setEnabled(not recording)
-        single = menu.addAction("Single", self._set_single_view)
-        single.setCheckable(True)
-        single.setChecked(len(self.view_ids) == MIN_VIEWS)
-        single.setEnabled(not recording)
+        single = menu.addAction("Single (close others)", self._set_single_view)
+        single.setToolTip("Close other views and keep only A; their loaded videos are unloaded")
+        single.setEnabled(not recording and len(self.view_ids) > MIN_VIEWS)
         presets = pane_layout.presets(self.view_ids)
         if not presets:
             return
@@ -575,7 +577,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"View {vid.upper()} added — drop or open a video")
 
     def _remove_last_view(self) -> None:
-        """Tear down the most recently added view (A/B stay)."""
+        """Tear down the most recently added view (A stays)."""
         if len(self.view_ids) <= MIN_VIEWS or not self._guard_edit("changing views"):
             return
         self._stop_playback()
@@ -594,6 +596,10 @@ class MainWindow(QMainWindow):
         self._destroy_view(vid, replacement=new_master)
         if removed_master:
             self._transport.reset_speeds()
+        if len(self.view_ids) == MIN_VIEWS:
+            # Single has no arrangement to preserve; adding views again
+            # should follow the default 1 -> 2 -> 3 -> 4 progression.
+            self._layout_customized = False
         self.view_host.apply_layout(self._layout, self.views)
         self._refresh_view_buttons()
         self._set_active_view(self._active_view)
@@ -748,10 +754,14 @@ class MainWindow(QMainWindow):
         """Remove trailing panes until only A remains, then reset the layout."""
         if not self._guard_edit("switching to single view"):
             return
+        closed = len(self.view_ids) - MIN_VIEWS
         while len(self.view_ids) > MIN_VIEWS:
             self._remove_last_view()
         self._set_layout(pane_layout.default_layout(self.view_ids), customized=False)
-        self.statusBar().showMessage("Single view")
+        if closed:
+            self.statusBar().showMessage(f"Single view — closed {closed} views, videos unloaded")
+        else:
+            self.statusBar().showMessage("Single view")
 
     def _reset_layout(self) -> None:
         if not self._guard_edit("rearranging views"):
@@ -1029,7 +1039,15 @@ class MainWindow(QMainWindow):
     def _align_current_frames(self) -> None:
         """One-shot sync: all current frames become the anchors."""
         if not self._transport.any_engine_ready():
-            self.statusBar().showMessage("Load two videos first to align")
+            if len(self.view_ids) == MIN_VIEWS:
+                message = (
+                    "Add a second view to align"
+                    if self._session.reference_ready
+                    else "Load a video first"
+                )
+                self.statusBar().showMessage(message)
+            else:
+                self.statusBar().showMessage("Load two videos first to align")
             return
         self._stop_playback()
         offsets, error = self._session.align_current()

@@ -50,6 +50,7 @@ class FakePlayer:
         self.speeds: list[float] = []
         self.plays = 0
         self.unloads = 0
+        self.terminated = 0
         self.load_error: str | None = None
         self._loading = False
         self._failed = False
@@ -86,7 +87,8 @@ class FakePlayer:
     def pause(self) -> None:
         self.is_playing = False
 
-    def terminate(self) -> None: ...
+    def terminate(self) -> None:
+        self.terminated += 1
 
     def unload(self) -> None:
         self.unloads += 1
@@ -173,6 +175,7 @@ def test_add_view_refuses_before_initialize(qapp: QApplication) -> None:
 def test_view_button_gating(qapp: QApplication) -> None:
     w = make_window(qapp, n=2)
     assert w.btn_add.isEnabled() and w.btn_remove.isEnabled()
+    assert "unloads its video" in w.btn_remove.toolTip()
     w._remove_last_view()
     assert w.btn_add.isEnabled() and not w.btn_remove.isEnabled()
     assert not w._open_actions["b"].isEnabled()
@@ -190,18 +193,36 @@ def test_four_views_default_to_2x2(qapp: QApplication) -> None:
     assert w._layout == [["a", "b"], ["c", "d"]]
 
 
-def test_single_layout_action_keeps_only_a_and_transport_works(qapp: QApplication) -> None:
+def test_single_layout_action_keeps_only_a_and_transport_works(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
     w = make_window(qapp, n=4)
     w._session.rebuild()
     p = _load_only(w, "a")
+    assert w._set_layout([["a", "b", "c", "d"]])
+    assert w._layout_customized
+    removed: list[str] = []
+    original = w._destroy_view
+
+    def spy(vid: str, *, replacement: str | None = None) -> None:
+        removed.append(vid)
+        original(vid, replacement=replacement)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(w, "_destroy_view", spy)
     menu = QMenu()
     w._populate_layout_menu(menu)
-    action = next(a for a in menu.actions() if a.text() == "Single")
+    action = next(a for a in menu.actions() if a.text() == "Single (close others)")
+    assert not action.isCheckable()
+    assert menu.toolTipsVisible()
+    assert "keep only A" in action.toolTip()
     action.trigger()
+    assert removed == ["d", "c", "b"]
+    assert all(p[vid].terminated == 1 for vid in ("b", "c", "d"))
 
     assert w.view_ids == ["a"]
     assert w._layout == [["a"]]
     assert not w._layout_customized
+    assert "closed 3 views" in w.statusBar().currentMessage()
     assert w.view_host.count == 1
     assert w.timeline._views == ["a"]
     assert w._session.engines == {}
@@ -215,10 +236,19 @@ def test_single_layout_action_keeps_only_a_and_transport_works(qapp: QApplicatio
     w._on_seek_committed(3.0)
     assert p["a"].seeks == [3.0]
 
+    p["a"].seeks.clear()
+    w._step(1)
+    assert p["a"].seeks == [pytest.approx(3.0 + 1.0 / 60.0)]
+    w._goto_last()
+    assert p["a"].seeks[-1] == pytest.approx(10.0 - 1.0 / 60.0)
+    w._goto_first()
+    assert p["a"].seeks[-1] == 0.0
+
     single_menu = QMenu()
     w._populate_layout_menu(single_menu)
-    single_action = next(a for a in single_menu.actions() if a.text() == "Single")
-    assert single_action.isChecked()
+    single_action = next(a for a in single_menu.actions() if a.text() == "Single (close others)")
+    assert not single_action.isCheckable()
+    assert not single_action.isEnabled()
     menu.deleteLater()
     single_menu.deleteLater()
 
@@ -239,6 +269,56 @@ def test_single_view_add_restores_default_dual_layout(
     assert w._layout == [["a", "b"]]
     assert w.btn_remove.isEnabled()
     assert w._open_actions["b"].isEnabled()
+
+
+def test_manual_remove_to_single_resets_custom_layout(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_ensure_player(view: VideoView) -> Any:
+        if view.surface._player is None:
+            view.surface._player = FakePlayer()
+        return view.surface._player
+
+    monkeypatch.setattr(VideoView, "ensure_player", fake_ensure_player)
+    w = make_window(qapp, n=4)
+    assert w._set_layout([["a", "b", "c", "d"]])
+    assert w._layout_customized
+    for _ in range(3):
+        w._remove_last_view()
+    assert w.view_ids == ["a"]
+    assert w._layout == [["a"]]
+    assert not w._layout_customized
+    for _ in range(3):
+        w._add_view()
+    assert w._layout == [["a", "b"], ["c", "d"]]
+
+
+def test_single_align_asks_for_a_second_view(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+    w._set_single_view()
+    w._align_current_frames()
+    assert w.statusBar().currentMessage() == "Add a second view to align"
+
+
+def test_single_align_without_video_asks_for_a_video(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._set_single_view()
+    w._align_current_frames()
+    assert w.statusBar().currentMessage() == "Load a video first"
+
+
+def test_single_with_empty_a_destroys_the_only_loaded_video(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "b")
+    assert w._session.master == "b"
+    w._set_single_view()
+    assert w.view_ids == ["a"]
+    assert w._session.master == "a"
+    assert p["b"].terminated == 1
+    assert w._transport.playable_range() is None
 
 
 def test_drop_on_left_edge_inserts_in_target_row(qapp: QApplication) -> None:
@@ -545,6 +625,8 @@ def test_single_loaded_timeline_click_seeks_master(qapp: QApplication) -> None:
     w = make_window(qapp, n=3)
     w._session.rebuild()
     p = _load_only(w, "a")
+    w._set_single_view()
+    assert w.timeline._views == ["a"]
     w.timeline.scrub_preview.connect(w._on_scrub_preview)
     w.timeline.seek_committed.connect(w._on_seek_committed)
     w.timeline.resize(600, w.timeline.minimumHeight())
@@ -778,6 +860,11 @@ def test_recording_blocks_presets_and_reset(qapp: QApplication) -> None:
     assert w._layout == [["a", "b"], ["c", "d"]]
     w._set_single_view()
     assert w.view_ids == ["a", "b", "c", "d"]
+    menu = QMenu()
+    w._populate_layout_menu(menu)
+    action = next(a for a in menu.actions() if a.text() == "Single (close others)")
+    assert not action.isEnabled()
+    menu.deleteLater()
 
 
 def test_drag_finish_clears_shortcuts_and_drop_state(qapp: QApplication) -> None:
