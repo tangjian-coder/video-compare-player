@@ -64,6 +64,13 @@ def _draw(painter: QPainter, name: str, color: str) -> None:
         painter.drawPolygon([QPointF(15.0, 5.0), QPointF(18.4, 8.2), QPointF(14.2, 10.4)])
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(pen)
+    elif name == "landscape":
+        painter.drawRoundedRect(QRectF(2.5, 5.0, 6.0, 10.0), 1.2, 1.2)
+        painter.drawRoundedRect(QRectF(11.0, 7.5, 6.5, 5.0), 1.2, 1.2)
+        painter.drawPolyline([QPointF(9.8, 5.5), QPointF(13.2, 5.5), QPointF(13.2, 8.9)])
+    elif name == "copy":
+        painter.drawRoundedRect(QRectF(7.0, 3.5, 9.5, 10.0), 1.6, 1.6)
+        painter.drawRoundedRect(QRectF(3.5, 7.0, 9.5, 10.0), 1.6, 1.6)
     elif name == "folder":
         painter.drawPolyline(
             [

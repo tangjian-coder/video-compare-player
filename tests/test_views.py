@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QMouseEvent, QPointingDevice
+from PySide6.QtCore import QEvent, QMimeData, QPointF, Qt, QUrl
+from PySide6.QtGui import QDropEvent, QMouseEvent, QPointingDevice
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMenu
 
@@ -25,6 +25,7 @@ from vcplayer.config import AppConfig
 from vcplayer.core.player import PlayerError
 from vcplayer.ui import layout as pane_layout
 from vcplayer.ui.main_window import MainWindow
+from vcplayer.ui.pane_drag import video_paths
 from vcplayer.ui.timeline import (
     TRACK_H,
     TRACK_LEFT,
@@ -46,6 +47,9 @@ class FakePlayer:
         self.time_pos: float | None = 0.0
         self.fps: float | None = 60.0
         self.rotation = 0
+        self.source_orientation: str | None = "landscape"
+        self.display_dimensions: tuple[float, float] | None = None
+        self.zoom = 1.0
         self.playback_time: float | None = None
         self.seeks: list[float] = []
         self.fast_seeks: list[float] = []
@@ -106,8 +110,11 @@ class FakePlayer:
 
     def set_crosshair(self, enabled: bool) -> None: ...
 
+    def set_rotation(self, degrees: int) -> None:
+        self.rotation = int(degrees) % 360
+
     def rotate_cw(self) -> None:
-        self.rotation = (self.rotation + 90) % 360
+        self.set_rotation(self.rotation + 90)
 
     def seek_exact(self, t: float) -> None:
         self.seeks.append(t)
@@ -118,6 +125,20 @@ class FakePlayer:
         self.time_pos = t
 
 
+class _AbortFuture(Future[Any]):
+    """Future with python-mpv's abort semantics: cancel never completes it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.aborted = False
+
+    def cancel(self) -> bool:
+        if self.done():
+            return False
+        self.aborted = True
+        return True
+
+
 class SlowFakePlayer(FakePlayer):
     """Player whose async seeks stay pending until the test resolves them."""
 
@@ -125,10 +146,10 @@ class SlowFakePlayer(FakePlayer):
         super().__init__()
         self.fast_async: list[float] = []
         self.exact_async: list[float] = []
-        self.pending: list[Future[Any]] = []
+        self.pending: list[_AbortFuture] = []
 
     def _future(self) -> Future[Any]:
-        future: Future[Any] = Future()
+        future = _AbortFuture()
         self.pending.append(future)
         return future
 
@@ -396,6 +417,110 @@ def test_open_video_shows_loading_feedback(qapp: QApplication, tmp_path: Path) -
     w._source_monitor.clear()
 
 
+def test_video_paths_preserves_order_and_filters(tmp_path: Path) -> None:
+    mp4 = tmp_path / "first.mp4"
+    mov = tmp_path / "second.MOV"
+    txt = tmp_path / "notes.txt"
+    mime = QMimeData()
+    mime.setUrls(
+        [
+            QUrl.fromLocalFile(str(txt)),
+            QUrl.fromLocalFile(str(mp4)),
+            QUrl.fromLocalFile(str(mov)),
+        ]
+    )
+    assert video_paths(mime) == [mp4, mov]
+
+
+def test_video_drop_forwards_all_paths(qapp: QApplication, tmp_path: Path) -> None:
+    view = VideoView("A")
+    seen: list[list[Path]] = []
+    view.files_dropped.connect(seen.append)
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mkv"
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(first)), QUrl.fromLocalFile(str(second))])
+    event = QDropEvent(
+        QPointF(10.0, 10.0),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    view.dropEvent(event)
+    view.surface.dropEvent(event)
+    assert seen == [[first, second], [first, second]]
+
+
+def test_single_drop_keeps_existing_view_count(qapp: QApplication, tmp_path: Path) -> None:
+    w = make_window(qapp, n=2)
+    clip = tmp_path / "single.mp4"
+    clip.write_bytes(b"x")
+    w._on_files_dropped("b", [clip])
+    assert w.view_ids == ["a", "b"]
+    assert w.views["b"].loading
+    assert w.views["b"]._loading_name.text() == "single.mp4"
+    assert not w.views["a"].loading
+    w._loads.clear()
+
+
+def test_multi_drop_auto_adds_and_wraps_from_target(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_ensure_player(view: VideoView) -> Any:
+        if view.surface._player is None:
+            view.surface._player = FakePlayer()
+        return view.surface._player
+
+    monkeypatch.setattr(VideoView, "ensure_player", fake_ensure_player)
+    w = make_window(qapp, n=2)
+    paths = [tmp_path / f"{name}.mp4" for name in ("one", "two", "three", "four")]
+    for path in paths:
+        path.write_bytes(b"x")
+
+    w._on_files_dropped("b", paths)
+    assert w.view_ids == ["a", "b", "c", "d"]
+    assert w.views["b"]._loading_name.text() == "one.mp4"
+    assert w.views["c"]._loading_name.text() == "two.mp4"
+    assert w.views["d"]._loading_name.text() == "three.mp4"
+    assert w.views["a"]._loading_name.text() == "four.mp4"
+    assert "Added 2 view(s)" in w.statusBar().currentMessage()
+    assert "Loading 4 videos: B, C, D, A" in w.statusBar().currentMessage()
+    w._loads.clear()
+
+
+def test_multi_drop_replaces_from_target_and_skips_extras(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    w = make_window(qapp, n=4)
+    paths = [tmp_path / f"{i}.mp4" for i in range(6)]
+    for path in paths:
+        path.write_bytes(b"x")
+
+    w._on_files_dropped("c", paths)
+    assert w.views["c"]._loading_name.text() == "0.mp4"
+    assert w.views["d"]._loading_name.text() == "1.mp4"
+    assert w.views["a"]._loading_name.text() == "2.mp4"
+    assert w.views["b"]._loading_name.text() == "3.mp4"
+    assert "(skipped 2)" in w.statusBar().currentMessage()
+    w._loads.clear()
+
+
+def test_multi_drop_is_blocked_while_recording(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_window(qapp, n=2)
+    monkeypatch.setattr(w, "_recording", lambda: True)
+    paths = [tmp_path / f"{i}.mp4" for i in range(2)]
+    for path in paths:
+        path.write_bytes(b"x")
+
+    w._on_files_dropped("a", paths)
+    assert w.view_ids == ["a", "b"]
+    assert not w.views["a"].loading
+    assert w.statusBar().currentMessage() == "Stop recording before opening videos"
+
+
 def test_placeholder_pages_are_parented(qapp: QApplication) -> None:
     view = VideoView("A")
     assert view._placeholder.parent() is view
@@ -441,7 +566,7 @@ def test_preview_coalesces_and_exact_wins(qapp: QApplication) -> None:
     w._on_seek_committed(4.0)
     assert player.exact_async == [4.0]
     assert player.seeks == []
-    assert player.pending.pop(0).cancelled()
+    assert player.pending.pop(0).aborted
     player.time_pos = 4.0
     player.pending.pop(0).set_result(None)
     w._on_ui_tick()
@@ -497,15 +622,19 @@ def test_seek_timeout_invalidates_late_completion(qapp: QApplication) -> None:
     w.views["a"].surface._player = player  # type: ignore[assignment]
 
     w._on_seek_committed(4.0)
+    old_token = w._transport._commit_token
     w._transport._commit_started -= 3.0
     w._on_ui_tick()
     assert not w._transport.exact_seek_pending
-    assert player.pending.pop(0).cancelled()
+    assert player.pending.pop(0).aborted
     assert "timed out" in w.statusBar().currentMessage()
 
+    # Deliver the stale completion explicitly; token invalidation must drop it.
     player.time_pos = 4.0
+    w._transport._seek_completions.put(("exact", old_token, None))
     w._on_ui_tick()
     assert not w._transport.exact_seek_pending
+    assert w.statusBar().currentMessage() == "Seek timed out; try again"
 
 
 def test_seek_target_is_clamped_before_virtual_step(qapp: QApplication) -> None:
@@ -608,7 +737,7 @@ def test_play_cancels_pending_preview(qapp: QApplication) -> None:
     assert w.timeline.preview_hold
     preview = player.pending.pop(0)
     w._toggle_play()
-    assert preview.cancelled()
+    assert preview.aborted
     assert w._transport.playing
     assert not w._transport.preview_pending
     w._on_ui_tick()
@@ -666,7 +795,7 @@ def test_stale_preview_completion_keeps_new_target(qapp: QApplication) -> None:
     w._on_scrub_preview(3.0)
     w._transport._preview_started -= 3.0
     w._on_ui_tick()
-    assert old.cancelled()
+    assert old.aborted
     assert w._transport.preview_pending
     assert w._transport._preview_target == pytest.approx(3.0)
 
@@ -695,7 +824,7 @@ def test_clear_sync_cancels_pending_seek(qapp: QApplication) -> None:
     assert w.timeline.preview_hold
 
     w._clear_sync()
-    assert exact.cancelled()
+    assert exact.aborted
     assert not w._transport.exact_seek_pending
     assert not w.timeline.preview_hold
     assert w.statusBar().currentMessage() == "Sync cleared"
@@ -764,9 +893,9 @@ def test_new_preview_cancels_pending_exact(qapp: QApplication) -> None:
 
     w._on_seek_committed(4.0)
     exact_future = player.pending.pop(0)
-    assert not exact_future.cancelled()
+    assert not exact_future.aborted
     w._on_scrub_preview(2.0)
-    assert exact_future.cancelled()
+    assert exact_future.aborted
     assert not w._transport.exact_seek_pending
     assert player.fast_async == [2.0]
     assert w.timeline._t["a"] == pytest.approx(2.0)
@@ -780,11 +909,12 @@ def test_loading_status_survives_reference_promotion(qapp: QApplication, tmp_pat
     w = make_window(qapp, n=2)
     path = tmp_path / "opening.mp4"
     path.write_bytes(b"x")
-    w.open_video("a", path)
+    w.open_video("b", path)
     w._on_load_progress()
+    assert w._session.master == "b"
     assert "opening opening.mp4" in w.statusBar().currentMessage()
     w._on_ui_tick()
-    assert w._status_live.text() == "A: opening…"
+    assert w._status_live.text().startswith("B: opening")
     w._loads.clear()
     w._source_monitor.clear()
 
@@ -1218,6 +1348,28 @@ def test_deferred_resync_does_not_steal_solo_playback(qapp: QApplication) -> Non
     assert p["b"].seeks == []
 
 
+def test_pause_resync_uses_synchronous_seek(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_window(qapp, n=2)
+    calls: list[bool] = []
+    monkeypatch.setattr(w._transport, "any_engine_ready", lambda: True)
+    monkeypatch.setattr(
+        w._session,
+        "resync_ready",
+        lambda *, async_seek=True: calls.append(async_seek),
+    )
+
+    w._transport.resync_if_needed()
+    assert calls == [False]
+
+
+def test_any_player_playing_tolerates_missing_player(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w.views["a"].surface._player = None
+    assert w._transport.any_player_playing() is False
+
+
 def test_single_solo_playback_shows_pause_icon(qapp: QApplication) -> None:
     w = make_window(qapp, n=2)
     w._session.rebuild()
@@ -1459,6 +1611,117 @@ def test_rotation_angle_uses_reserved_label(qapp: QApplication) -> None:
     view._on_rotate()
     assert view._rotation_label.text() == "180°"
     assert view._rotation_label.width() == 30
+
+
+def test_copy_button_copies_filename(qapp: QApplication) -> None:
+    view = VideoView("A")
+    seen: list[tuple[str, str]] = []
+    view.name_copied.connect(lambda vid, name: seen.append((vid, name)))
+    view.set_loaded_name("clip.mp4")
+    assert not view.btn_copy.isHidden()
+
+    QApplication.clipboard().setText("sentinel")
+    view.btn_copy.click()
+    assert QApplication.clipboard().text() == "clip.mp4"
+    assert seen == [("a", "clip.mp4")]
+
+
+def test_copy_button_ignores_missing_suffix_and_hides_on_clear(qapp: QApplication) -> None:
+    view = VideoView("A")
+    view.set_loaded_name("clip.mp4")
+    view.set_source_missing(True)
+    view.btn_copy.click()
+    assert QApplication.clipboard().text() == "clip.mp4"
+
+    view.clear_loaded()
+    assert view.btn_copy.isHidden()
+    QApplication.clipboard().setText("sentinel")
+    view.btn_copy.click()
+    assert QApplication.clipboard().text() == "sentinel"
+
+
+def test_copy_button_is_available_while_loading(qapp: QApplication) -> None:
+    view = VideoView("A")
+    view.set_loading("opening.mp4")
+    assert not view.btn_copy.isHidden()
+    view.btn_copy.click()
+    assert QApplication.clipboard().text() == "opening.mp4"
+
+
+def test_copy_button_reports_to_status_bar(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    view = w.views["a"]
+    view.name_copied.connect(w._on_name_copied)
+    view.set_loaded_name("clip.mp4")
+    view.btn_copy.click()
+    assert w.statusBar().currentMessage() == "A: copied clip.mp4"
+
+
+def test_auto_landscape_applies_to_loaded_views(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_window(qapp, n=2)
+    p = _players(w)
+    p["a"].meta = p["b"].meta = object()
+    p["a"].duration = p["b"].duration = 10.0
+    p["a"].source_orientation = "portrait"
+    p["b"].source_orientation = "landscape"
+    p["b"].rotation = 90
+    monkeypatch.setattr(w.config, "save", lambda: None)
+
+    w._on_auto_landscape_toggled(True)
+    assert w.config.auto_landscape is True
+    assert p["a"].rotation == 90
+    assert p["b"].rotation == 0
+    assert w.statusBar().currentMessage() == "Auto landscape on"
+
+    w._on_auto_landscape_toggled(False)
+    assert w.config.auto_landscape is False
+    assert p["a"].rotation == 90
+    assert p["b"].rotation == 0
+    assert w.statusBar().currentMessage() == "Auto landscape off"
+
+
+def test_loaded_portrait_rotates_when_auto_landscape_on(qapp: QApplication, tmp_path: Path) -> None:
+    w = make_window(qapp, n=2)
+    p = _players(w)
+    p["a"].meta = object()
+    p["a"].duration = 10.0
+    p["a"].source_orientation = "portrait"
+    w.config.auto_landscape = True
+    clip = tmp_path / "portrait.mp4"
+    clip.write_bytes(b"x")
+
+    w._on_video_loaded("a", clip, object())
+    assert p["a"].rotation == 90
+    assert w.views["a"]._rotation_label.text() == "90°"
+    w._source_monitor.clear()
+    w._loads.clear()
+
+
+def test_new_load_resets_inherited_rotation(qapp: QApplication, tmp_path: Path) -> None:
+    w = make_window(qapp, n=2)
+    p = _players(w)
+    p["a"].rotation = 90
+    clip = tmp_path / "landscape.mp4"
+    clip.write_bytes(b"x")
+
+    assert w.open_video("a", clip)
+    assert p["a"].rotation == 0
+    assert w.views["a"]._rotation_label.text() == ""
+    w._loads.clear()
+
+
+def test_display_size_uses_final_mpv_dimensions(qapp: QApplication) -> None:
+    view = VideoView("A")
+    player = FakePlayer()
+    player.meta = object()
+    player.rotation = 90
+    player.display_dimensions = (1920.0, 1080.0)
+    view.surface._player = player  # type: ignore[assignment]
+    view.surface.resize(800, 600)
+
+    assert view.surface._display_size() == pytest.approx((800.0, 450.0))
 
 
 def test_pane_hover_signal_is_deduplicated(qapp: QApplication) -> None:

@@ -32,12 +32,13 @@ def make_view_mime(view_id: str) -> QMimeData:
     return mime
 
 
-def first_video_path(mime: QMimeData | None) -> str | None:
-    """First dropped local file with a video extension."""
+def video_paths(mime: QMimeData | None) -> list[Path]:
+    """Dropped local video files, preserving drag order."""
     if mime is None or not mime.hasUrls():
-        return None
+        return []
+    paths: list[Path] = []
     for url in mime.urls():
         local = url.toLocalFile()
-        if Path(local).suffix.lower() in VIDEO_EXTS:
-            return local
-    return None
+        if local and Path(local).suffix.lower() in VIDEO_EXTS:
+            paths.append(Path(local))
+    return paths

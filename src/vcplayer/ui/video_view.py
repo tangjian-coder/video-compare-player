@@ -58,7 +58,7 @@ from ..core.player import PlayerController
 from ..core.sync import ViewId
 from .icons import make_icon
 from .layout import ZONE_CENTER, zone_at
-from .pane_drag import decode_view_id, first_video_path, make_view_mime
+from .pane_drag import decode_view_id, make_view_mime, video_paths
 from .theme import ACCENT_BLUE, VIEW_COLORS, on_view_color
 from .widgets import set_style_property
 
@@ -129,7 +129,7 @@ class MpvSurface(QWidget):
     """Native render surface for libmpv; owns mouse input for zoom/pan."""
 
     clicked = Signal()
-    file_dropped = Signal(str)
+    files_dropped = Signal(object)
     zoom_changed = Signal(float)  # current linear zoom factor
     # Gestures relay to the paired surface unless Ctrl is held: the default
     # intent in a comparison tool is steering both views at once, Ctrl opts
@@ -192,10 +192,15 @@ class MpvSurface(QWidget):
         rotated frame. Pan limits and pixel->pan conversion both depend
         on this.
         """
-        if self._player is None or self._player.meta is None:
+        if self._player is None:
             return None
-        meta = self._player.meta
-        vw, vh = rotated_size(float(meta.width), float(meta.height), self._player.rotation)
+        dimensions = getattr(self._player, "display_dimensions", None)
+        if dimensions is None and self._player.meta is not None:
+            meta = self._player.meta
+            dimensions = rotated_size(float(meta.width), float(meta.height), self._player.rotation)
+        if dimensions is None:
+            return None
+        vw, vh = dimensions
         w, h = float(self.width()), float(self.height())
         if vw <= 0 or vh <= 0 or w <= 0 or h <= 0:
             return None
@@ -361,7 +366,7 @@ class MpvSurface(QWidget):
                     view.pane_drag_move(self.mapTo(view, event.position().toPoint()), source)
                 event.acceptProposedAction()
                 return
-        if first_video_path(event.mimeData()) is not None:
+        if video_paths(event.mimeData()):
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:
@@ -389,9 +394,9 @@ class MpvSurface(QWidget):
             event.accept()
             view.pane_drag_drop(source, self.mapTo(view, event.position().toPoint()))
             return
-        local = first_video_path(event.mimeData())
-        if local is not None:
-            self.file_dropped.emit(local)
+        paths = video_paths(event.mimeData())
+        if paths:
+            self.files_dropped.emit(paths)
             event.acceptProposedAction()
 
 
@@ -580,7 +585,7 @@ class VideoView(QFrame):
     """One comparison block: header (badge + filename), video, footer controls."""
 
     clicked = Signal(str)  # emits view_name
-    file_dropped = Signal(str)
+    files_dropped = Signal(object)
     layout_drag_started = Signal(str)  # source view id
     layout_drag_finished = Signal()
     view_dropped_on = Signal(str, str, str)  # source, target, drop zone
@@ -588,6 +593,7 @@ class VideoView(QFrame):
     drop_zone_changed = Signal(str, str)  # target view id, zone ("" = cleared)
     hover_changed = Signal(str, bool)  # view id, pointer inside/outside
     clear_requested = Signal(str)  # view id; unload this pane's video
+    name_copied = Signal(str, str)  # view id, copied filename
 
     def __init__(self, view_name: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -616,6 +622,15 @@ class VideoView(QFrame):
         header.setSpacing(6)
         header.addWidget(self._badge)
         header.addWidget(self._caption, stretch=1)
+        self.btn_copy = QPushButton()
+        self.btn_copy.setObjectName("miniButton")
+        self.btn_copy.setIcon(make_icon("copy", "#a1a1a6"))
+        self.btn_copy.setIconSize(QSize(14, 14))
+        self.btn_copy.setToolTip("Copy this video's file name")
+        self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_copy.setVisible(False)
+        header.addWidget(self.btn_copy)
         self.btn_clear = QPushButton()
         self.btn_clear.setObjectName("miniButton")
         self.btn_clear.setIcon(make_icon("x", "#a1a1a6"))
@@ -754,12 +769,13 @@ class VideoView(QFrame):
             lambda pos: self.context_menu_requested.emit(self.view_id, pos)
         )
         self.surface.clicked.connect(lambda: self.clicked.emit(self.view_name))
-        self.surface.file_dropped.connect(self.file_dropped)
+        self.surface.files_dropped.connect(self.files_dropped)
         # The signal carries the just-written zoom value: display that
         # directly instead of re-reading the mpv property (a round-trip
         # that can serve a stale value inside the slot call chain).
         self.surface.zoom_changed.connect(self._on_zoom_changed)
         self.btn_rotate.clicked.connect(self._on_rotate)
+        self.btn_copy.clicked.connect(self._copy_name)
         self.btn_clear.clicked.connect(lambda: self.clear_requested.emit(self.view_id))
 
     def _cursor_inside(self) -> bool:
@@ -825,6 +841,12 @@ class VideoView(QFrame):
             self.surface.player.rotate_cw()
         self._set_rotate_text()
 
+    def set_rotation(self, degrees: int) -> None:
+        """Set this view's absolute display rotation."""
+        if self.surface.has_player:
+            self.surface.player.set_rotation(degrees)
+        self._set_rotate_text()
+
     def _set_rotate_text(self) -> None:
         """Show the current angle beside the icon (local state only)."""
         player = self.surface.player if self.surface.has_player else None
@@ -849,15 +871,25 @@ class VideoView(QFrame):
         """Create the underlying mpv player (idempotent)."""
         return self.surface.ensure_player()
 
+    def _copy_name(self) -> None:
+        """Copy the loaded filename, without the missing-source suffix."""
+        name = self._loaded_name
+        if name is None:
+            return
+        QApplication.clipboard().setText(name)
+        self.name_copied.emit(self.view_id, name)
+
     def set_loading(self, name: str) -> None:
         """Show immediate load feedback while metadata is still pending."""
         self._loaded_name = name
         self._source_missing = False
         self._loading = True
+        self.set_rotation(0)
         self._render_source_label()
         self._loading_name.setText(name)
         self._stack.setCurrentWidget(self._loading_page)
         self.surface.hide()
+        self.btn_copy.setVisible(True)
         self.btn_clear.setVisible(True)
         self._time_label.setText("--")
         self._playing_icon_state = None
@@ -870,6 +902,7 @@ class VideoView(QFrame):
         self._loading = False
         self._render_source_label()
         self._stack.setCurrentWidget(self.surface)
+        self.btn_copy.setVisible(True)
         self.btn_clear.setVisible(True)
         if self._hovered:  # pointer stayed on the pane across clear/reload
             self.hover_changed.emit(self.view_id, True)
@@ -928,6 +961,7 @@ class VideoView(QFrame):
         self._playing_icon_state = None
         self.set_play_text(False)
         self._set_rotate_text()
+        self.btn_copy.setVisible(False)
         self.btn_clear.setVisible(False)
         self._placeholder.update()
         self.update()
@@ -987,7 +1021,7 @@ class VideoView(QFrame):
             if source != self.view_id:
                 event.acceptProposedAction()
             return
-        if first_video_path(event.mimeData()) is not None:
+        if video_paths(event.mimeData()):
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:
@@ -1024,7 +1058,7 @@ class VideoView(QFrame):
             event.accept()
             self.pane_drag_drop(source, event.position().toPoint())
             return
-        local = first_video_path(event.mimeData())
-        if local is not None:
-            self.file_dropped.emit(local)
+        paths = video_paths(event.mimeData())
+        if paths:
+            self.files_dropped.emit(paths)
             event.acceptProposedAction()

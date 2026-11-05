@@ -108,7 +108,10 @@ class TransportController:
     def any_player_playing(self) -> bool:
         """True when any ready view is actually playing, including solo mode."""
         return any(
-            view.player.is_ready and view.player.is_playing and not self._at_stream_end(view.player)
+            view.surface.has_player
+            and view.player.is_ready
+            and view.player.is_playing
+            and not self._at_stream_end(view.player)
             for view in self._session.views.values()
         )
 
@@ -439,7 +442,9 @@ class TransportController:
             view.player.is_ready and view.player.is_playing for view in self._session.views.values()
         ):
             return
-        self._session.resync_ready()
+        # Delayed pause resync must stay inside the transport state machine;
+        # an untracked async future can land after the user resumes playback.
+        self._session.resync_ready(async_seek=False)
 
     def seek_master_all(self, master: float, *, exact: bool = True) -> bool:
         if self._session.has_missing_source:

@@ -2,8 +2,27 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+
+Orientation = Literal["portrait", "landscape"]
+
+
+def display_orientation(width: float, height: float, rotation: float = 0.0) -> Orientation | None:
+    """Classify the displayed orientation after rotation metadata is applied."""
+    if (
+        not math.isfinite(width)
+        or not math.isfinite(height)
+        or not math.isfinite(rotation)
+        or width <= 0.0
+        or height <= 0.0
+    ):
+        return None
+    if round(rotation) % 180:
+        width, height = height, width
+    return "portrait" if height > width else "landscape"
 
 
 @dataclass(frozen=True)

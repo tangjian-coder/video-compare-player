@@ -79,6 +79,7 @@ class AppConfig:
     last_dir: str = ""
     speed: float = 1.0
     crosshair: bool = False
+    auto_landscape: bool = False
     window: WindowConfig = field(default_factory=WindowConfig)
 
     @classmethod
@@ -95,6 +96,7 @@ class AppConfig:
                 last_dir=str(raw.get("last_dir", "")),
                 speed=_clean_speed(raw.get("speed", 1.0)),
                 crosshair=bool(raw.get("crosshair", False)),
+                auto_landscape=bool(raw.get("auto_landscape", False)),
                 window=WindowConfig(
                     width=int(win.get("width", 1720)),
                     height=int(win.get("height", 960)),

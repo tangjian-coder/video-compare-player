@@ -200,6 +200,14 @@ class MainWindow(QMainWindow):
             "Show a crosshair at the center of every view,\n"
             "a fixed reference for comparing motion amplitude. (C)"
         )
+        self.btn_auto_landscape = QPushButton()
+        self.btn_auto_landscape.setObjectName("autoLandscapeButton")
+        self.btn_auto_landscape.setIcon(make_icon("landscape", "#64d2ff"))
+        self.btn_auto_landscape.setIconSize(QSize(16, 16))
+        self.btn_auto_landscape.setCheckable(True)
+        self.btn_auto_landscape.setToolTip(
+            "Auto landscape: rotate portrait videos 90° clockwise when opened"
+        )
         # Same NoFocus treatment for the remaining shortcut-bearing buttons
         # (S / R / F9 / C / V keys would otherwise re-trigger them).
         for btn in (
@@ -209,6 +217,7 @@ class MainWindow(QMainWindow):
             self.btn_sync_clear,
             self.btn_rec,
             self.btn_crosshair,
+            self.btn_auto_landscape,
         ):
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         perf.mark("ui.toolbar", section_start)
@@ -245,6 +254,7 @@ class MainWindow(QMainWindow):
         right_group.addWidget(self.btn_sync_clear)
         right_group.addWidget(self.btn_rec)
         right_group.addWidget(self.btn_crosshair)
+        right_group.addWidget(self.btn_auto_landscape)
         transport.addLayout(right_group)
         perf.mark("ui.transport", section_start)
 
@@ -357,6 +367,7 @@ class MainWindow(QMainWindow):
         self.btn_sync_clear.clicked.connect(self._clear_sync)
         self.btn_rec.clicked.connect(self._toggle_record)
         self.btn_crosshair.toggled.connect(self._on_crosshair_toggled)
+        self.btn_auto_landscape.toggled.connect(self._on_auto_landscape_toggled)
 
         self._add_shortcut(Qt.Key.Key_Space, self._toggle_play)
         self._add_shortcut(Qt.Key.Key_Left, lambda: self._step(-1))
@@ -385,9 +396,10 @@ class MainWindow(QMainWindow):
         self._transport.set_speed(speed)
 
         self._initialized = True
-        # Players exist now: apply the persisted crosshair state (setChecked
-        # only fires toggled on an actual change).
+        # Players exist now: apply persisted crosshair and auto-landscape
+        # state (setChecked only fires toggled on an actual change).
         self.btn_crosshair.setChecked(self.config.crosshair)
+        self.btn_auto_landscape.setChecked(self.config.auto_landscape)
 
         # Load A/B before extra CLI views: A starts loading first, so the
         # reference-promotion policy cannot hand the master to C/D.
@@ -409,7 +421,7 @@ class MainWindow(QMainWindow):
 
     def _wire_view(self, view: VideoView, view_id: ViewId) -> None:
         """Connect one video block's signals and per-view buttons."""
-        view.file_dropped.connect(lambda p, v=view_id: self.open_video(v, Path(p)))
+        view.files_dropped.connect(lambda paths, v=view_id: self._on_files_dropped(v, paths))
         view.clicked.connect(self._set_active_view)
         view.layout_drag_started.connect(self._on_layout_drag_started)
         view.layout_drag_finished.connect(self._on_layout_drag_finished)
@@ -418,6 +430,7 @@ class MainWindow(QMainWindow):
         view.hover_changed.connect(self._on_view_hover_changed)
         view.context_menu_requested.connect(self._on_view_context_menu)
         view.clear_requested.connect(self._clear_view_video)
+        view.name_copied.connect(self._on_name_copied)
         view.btn_step_back.clicked.connect(lambda checked=False, v=view_id: self._step_view(v, -1))
         view.btn_step_fwd.clicked.connect(lambda checked=False, v=view_id: self._step_view(v, 1))
         view.btn_play.clicked.connect(lambda checked=False, v=view_id: self._toggle_play_view(v))
@@ -962,10 +975,51 @@ class MainWindow(QMainWindow):
                 durs[vid] = None
         self.timeline.set_durations(durs)
 
-    def open_video(self, view: ViewId, path: Path) -> None:
-        """Load a video into one of the views."""
-        if view not in self.views or not self._guard_edit("opening videos"):
+    def _on_files_dropped(self, target: ViewId, paths: list[Path]) -> None:
+        """Load one dropped file into the target, or batch-fill from it."""
+        videos = [path if isinstance(path, Path) else Path(path) for path in paths]
+        if not videos:
             return
+        if len(videos) == 1:
+            self.open_video(target, videos[0])
+            return
+        if not self._guard_edit("opening videos"):
+            return
+
+        added = 0
+        wanted_views = min(len(videos), MAX_VIEWS)
+        while len(self.view_ids) < wanted_views:
+            if not self._add_view():
+                break
+            added += 1
+
+        ids = list(self.view_ids)
+        if not ids:
+            return
+        start = ids.index(target) if target in ids else 0
+        count = min(len(videos), len(ids))
+        targets = [ids[(start + i) % len(ids)] for i in range(count)]
+        started: list[ViewId] = []
+        for path, vid in zip(videos[:count], targets, strict=True):
+            if self.open_video(vid, path):
+                started.append(vid)
+        if not started:
+            self.statusBar().showMessage("Could not open the dropped videos")
+            return
+        self._set_active_view(target if target in self.views else targets[0])
+
+        names = ", ".join(vid.upper() for vid in started)
+        prefix = f"Added {added} view(s); " if added else ""
+        message = f"{prefix}Loading {len(started)} videos: {names}"
+        skipped = len(videos) - len(started)
+        if skipped:
+            message += f" (skipped {skipped})"
+        self.statusBar().showMessage(message)
+
+    def open_video(self, view: ViewId, path: Path) -> bool:
+        """Load a video into one of the views; True when accepted."""
+        if view not in self.views or not self._guard_edit("opening videos"):
+            return False
         started = perf.begin()
         self._stop_playback()
         self._transport.cancel_pending_seeks()
@@ -974,7 +1028,7 @@ class MainWindow(QMainWindow):
             self.views[view].player.load(path)
         except PlayerError as exc:
             QMessageBox.warning(self, "open failed", str(exc))
-            return
+            return False
         # Only a successfully accepted load stops watching the old source.
         self._source_monitor.forget(view)
         self.views[view].set_source_missing(False)
@@ -990,6 +1044,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{view.upper()}: opening {path.name}…")
         perf.mark("load.requested", view=view, file=path.name)
         logger.info("view %s <- %s", view, path)
+        return True
 
     def _on_load_progress(self) -> None:
         """Keep timeline durations and reference promotion current during loading."""
@@ -1009,6 +1064,7 @@ class MainWindow(QMainWindow):
         source = Path(str(path))
         name = source.name
         view.set_loaded_name(name)
+        self._apply_auto_landscape(view)
         self._source_monitor.track(vid, source)
         perf.mark("load.ready", self._load_started.pop(vid, None), view=vid, file=name)
         self._notify(f"{vid.upper()}: {name} loaded")
@@ -1167,6 +1223,10 @@ class MainWindow(QMainWindow):
         for pane_id, pane in self.views.items():
             set_style_property(pane, "activePane", "true" if pane_id == vid else "")
 
+    def _on_name_copied(self, view_id: str, name: str) -> None:
+        """Acknowledge a pane's filename copy in the status bar."""
+        self.statusBar().showMessage(f"{view_id.upper()}: copied {name}")
+
     def _invalidate_sync(self, view: ViewId) -> None:
         """Drop sync anchors that involve a (re)loaded view."""
         affected = self._session.affected_by(view)
@@ -1310,6 +1370,31 @@ class MainWindow(QMainWindow):
         for view in self.views.values():
             view.player.set_crosshair(checked)
         self.statusBar().showMessage("Crosshair on" if checked else "Crosshair off")
+
+    # -- auto landscape ---------------------------------------------------------
+
+    def _on_auto_landscape_toggled(self, checked: bool) -> None:
+        """Persist the mode and apply it to every loaded video when enabled."""
+        self.config.auto_landscape = checked
+        self.config.save()
+        if not self._initialized:
+            return  # before initialize(); state applies on setChecked there
+        if checked:
+            for view in self.views.values():
+                self._apply_auto_landscape(view)
+        self.statusBar().showMessage("Auto landscape on" if checked else "Auto landscape off")
+
+    def _apply_auto_landscape(self, view: VideoView) -> None:
+        """Force a ready view into landscape after a load or mode change."""
+        if not self.config.auto_landscape or not view.surface.has_player:
+            return
+        if not view.player.is_ready:
+            return
+        orientation = view.player.source_orientation
+        if orientation == "portrait":
+            view.set_rotation(90)
+        elif orientation == "landscape":
+            view.set_rotation(0)
 
     # -- file dialog ------------------------------------------------------------------
 

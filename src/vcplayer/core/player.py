@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from .models import VideoMeta
+from .models import Orientation, VideoMeta, display_orientation
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +294,48 @@ class PlayerController:
         return self._rotation
 
     @property
+    def display_dimensions(self) -> tuple[float, float] | None:
+        """Final pre-scale video size after metadata and manual rotation."""
+        if self._terminated:
+            return None
+        try:
+            params = self._mpv.video_params
+        except (AttributeError, TypeError, ValueError, RuntimeError, SystemError):
+            return None
+        if not isinstance(params, dict):
+            return None
+        try:
+            width = float(params.get("dw") or params.get("w") or 0.0)
+            height = float(params.get("dh") or params.get("h") or 0.0)
+            rotation = float(params.get("rotate") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(width) or not math.isfinite(height) or width <= 0.0 or height <= 0.0:
+            return None
+        if round(rotation) % 180:
+            width, height = height, width
+        return width, height
+
+    @property
+    def source_orientation(self) -> Orientation | None:
+        """Displayed source orientation before the manual view rotation."""
+        if self._terminated:
+            return None
+        try:
+            params = self._mpv.video_params
+        except (AttributeError, TypeError, ValueError, RuntimeError, SystemError):
+            return None
+        if not isinstance(params, dict):
+            return None
+        try:
+            width = float(params.get("dw") or params.get("w") or 0.0)
+            height = float(params.get("dh") or params.get("h") or 0.0)
+            rotation = float(params.get("rotate") or 0.0) - self._rotation
+        except (TypeError, ValueError):
+            return None
+        return display_orientation(width, height, rotation)
+
+    @property
     def crosshair(self) -> bool:
         """Whether the center crosshair overlay is shown."""
         return self._crosshair
@@ -445,6 +487,17 @@ class PlayerController:
         self.set_zoom(1.0)
         self.set_pan(0.0, 0.0)
 
+    def set_rotation(self, degrees: int) -> None:
+        """Set the absolute display rotation, resetting pan when it changes."""
+        if self._terminated:
+            return
+        rotation = int(degrees) % 360
+        if rotation == self._rotation:
+            return
+        self._rotation = rotation
+        self._mpv.video_rotate = rotation
+        self.set_pan(0.0, 0.0)
+
     def rotate_cw(self) -> None:
         """Rotate the display 90 degrees clockwise.
 
@@ -454,9 +507,7 @@ class PlayerController:
         """
         if self._terminated:
             return
-        self._rotation = (self._rotation + 90) % 360
-        self._mpv.video_rotate = self._rotation
-        self.set_pan(0.0, 0.0)
+        self.set_rotation(self._rotation + 90)
 
     def set_crosshair(self, enabled: bool) -> None:
         """Show or hide the red crosshair at the pane center.

@@ -165,6 +165,23 @@ QPushButton#crosshairButton:hover {
 QPushButton#crosshairButton:checked {
     background: rgba(255, 159, 10, 46);
 }
+QPushButton#autoLandscapeButton {
+    background: transparent;
+    border: none;
+    color: #64d2ff;
+    padding: 0;
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 28px;
+    max-height: 28px;
+    border-radius: 6px;
+}
+QPushButton#autoLandscapeButton:hover {
+    background: rgba(100, 210, 255, 31);
+}
+QPushButton#autoLandscapeButton:checked {
+    background: rgba(100, 210, 255, 46);
+}
 
 /* -- inputs -------------------------------------------------------------- */
 QComboBox {

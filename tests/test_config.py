@@ -67,12 +67,20 @@ def test_clean_speed_handles_garbage() -> None:
 
 def test_save_and_load_roundtrip(tmp_path: Path) -> None:
     p = tmp_path / "cfg.json"
-    cfg = AppConfig(last_dir="D:/x", speed=0.5, crosshair=True)
+    cfg = AppConfig(last_dir="D:/x", speed=0.5, crosshair=True, auto_landscape=True)
     cfg.save(p)
     loaded = AppConfig.load(p)
     assert loaded.last_dir == "D:/x"
     assert loaded.speed == 0.5
     assert loaded.crosshair is True
+    assert loaded.auto_landscape is True
+
+
+def test_auto_landscape_defaults_off(tmp_path: Path) -> None:
+    assert AppConfig.load(tmp_path / "none.json").auto_landscape is False
+    p = tmp_path / "cfg.json"
+    _write(p, '{"auto_landscape": 1}')
+    assert AppConfig.load(p).auto_landscape is True
 
 
 def test_crosshair_defaults_off_and_tolerates_garbage(tmp_path: Path) -> None:
