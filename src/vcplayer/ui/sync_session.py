@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
@@ -17,6 +18,8 @@ from ..core.sync import (
     player_frame_rate,
 )
 from .video_view import VideoView
+
+logger = logging.getLogger(__name__)
 
 
 def _completed_future() -> Future[Any]:
@@ -175,12 +178,17 @@ class SyncSession:
                 player.seek_fast(master)
             seeks.append(AsyncSeek(self.master, _completed_future(), master))
         for vid, eng in self.engines.items():
-            if eng.ready:
+            if not eng.ready:
+                continue
+            try:
                 target = eng.follower_target(master)
                 future = eng.seek_follower_async(master, exact=exact)
-                seeks.append(AsyncSeek(vid, future, target))
-                # A hard seek invalidates the EWMA the loop was built on.
-                eng.reset_runtime()
+            except Exception as exc:  # one broken follower must not drop the batch
+                logger.warning("view %s async seek failed: %s", vid, exc)
+                continue
+            seeks.append(AsyncSeek(vid, future, target))
+            # A hard seek invalidates the EWMA the loop was built on.
+            eng.reset_runtime()
         return seeks or None
 
     def current_anchors(self) -> dict[ViewId, float | None]:

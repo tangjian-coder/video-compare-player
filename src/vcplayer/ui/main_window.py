@@ -1225,7 +1225,9 @@ class MainWindow(QMainWindow):
 
     def _on_name_copied(self, view_id: str, name: str) -> None:
         """Acknowledge a pane's filename copy in the status bar."""
-        self.statusBar().showMessage(f"{view_id.upper()}: copied {name}")
+        view = self.views.get(cast(ViewId, view_id.lower()))
+        suffix = " (source still missing)" if view is not None and view.source_missing else ""
+        self.statusBar().showMessage(f"{view_id.upper()}: copied {name}{suffix}")
 
     def _invalidate_sync(self, view: ViewId) -> None:
         """Drop sync anchors that involve a (re)loaded view."""

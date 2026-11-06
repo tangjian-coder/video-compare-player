@@ -23,7 +23,8 @@ from .video_view import VideoView
 
 logger = logging.getLogger(__name__)
 
-SEEK_TIMEOUT_S = 2.0
+PREVIEW_TIMEOUT_S = 2.0
+EXACT_SEEK_TIMEOUT_S = 5.0
 
 
 @dataclass
@@ -55,6 +56,7 @@ class TransportController:
         self._seek_seq = 0
         self._seek_lock = Lock()
         self._seek_completions: SimpleQueue[tuple[str, int, str | None]] = SimpleQueue()
+        self._dispatch_error: str | None = None
         self._preview_inflight = False
         self._preview_token = 0
         self._preview_pending: float | None = None
@@ -175,7 +177,7 @@ class TransportController:
                 self._commit_started = time.monotonic()
 
         now = time.monotonic()
-        if self._preview_inflight and now - self._preview_started > SEEK_TIMEOUT_S:
+        if self._preview_inflight and now - self._preview_started > PREVIEW_TIMEOUT_S:
             logger.warning("preview seek timed out; dropping in-flight preview")
             self._cancel_preview_futures()
             self._preview_inflight = False
@@ -186,7 +188,7 @@ class TransportController:
             else:
                 self._preview_target = None
 
-        if self.exact_seek_pending and now - self._commit_started > SEEK_TIMEOUT_S:
+        if self.exact_seek_pending and now - self._commit_started > EXACT_SEEK_TIMEOUT_S:
             logger.warning("exact seek timed out; releasing transport")
             self._cancel_commit_futures()
             self._notify("Seek timed out; try again")
@@ -200,7 +202,14 @@ class TransportController:
     def _dispatch_async(
         self, master: float, *, exact: bool, kind: str
     ) -> tuple[int, list[AsyncSeek]] | None:
-        seeks = self._session.seek_master_all_async(master, exact=exact)
+        self._dispatch_error = None
+        try:
+            seeks = self._session.seek_master_all_async(master, exact=exact)
+        except Exception as exc:  # a broken mpv core must not escape a Qt slot
+            self._dispatch_error = str(exc)
+            logger.warning("seek dispatch failed: %s", exc, exc_info=True)
+            self._notify(f"Seek failed: {exc}")
+            return None
         if not seeks:
             return None
         self._seek_seq += 1
@@ -231,7 +240,7 @@ class TransportController:
         if dispatched is None:
             self._preview_inflight = False
             self._preview_target = None
-            if self.any_engine_ready():
+            if self._dispatch_error is None and self.any_engine_ready():
                 self._notify("No common range between loaded views")
             return False
         token, seeks = dispatched
@@ -258,7 +267,7 @@ class TransportController:
         from_times = {vid: pane.player.time_pos for vid, pane in self._session.views.items()}
         dispatched = self._dispatch_async(target, exact=True, kind="exact")
         if dispatched is None:
-            if self.any_engine_ready():
+            if self._dispatch_error is None and self.any_engine_ready():
                 self._notify("No common range between loaded views")
             return False
         token, seeks = dispatched

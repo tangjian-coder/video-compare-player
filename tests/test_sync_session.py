@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from types import SimpleNamespace
+from typing import Any
 
 from vcplayer.core.sync import SyncEngine
 from vcplayer.ui.sync_session import SyncSession
@@ -121,6 +123,24 @@ def test_playable_range_rejects_zero_width_pair() -> None:
     assert session.playable_range() is None
     assert not session.seek_master_all(0.0)
     assert a.seeks == []
+
+
+def test_async_batch_skips_broken_follower() -> None:
+    session, a, b = make_session()
+
+    def master_seek(_t: float) -> Future[Any]:
+        future: Future[Any] = Future()
+        future.set_result(None)
+        return future
+
+    def broken_seek(_t: float) -> Future[Any]:
+        raise RuntimeError("follower failed")
+
+    a.seek_exact_async = master_seek  # type: ignore[attr-defined]
+    b.seek_exact_async = broken_seek  # type: ignore[attr-defined]
+    seeks = session.seek_master_all_async(5.0)
+    assert seeks is not None
+    assert [seek.view for seek in seeks] == ["a"]
 
 
 def test_reference_fps_falls_back_to_meta() -> None:

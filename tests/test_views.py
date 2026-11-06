@@ -623,7 +623,7 @@ def test_seek_timeout_invalidates_late_completion(qapp: QApplication) -> None:
 
     w._on_seek_committed(4.0)
     old_token = w._transport._commit_token
-    w._transport._commit_started -= 3.0
+    w._transport._commit_started -= 6.0
     w._on_ui_tick()
     assert not w._transport.exact_seek_pending
     assert player.pending.pop(0).aborted
@@ -1655,6 +1655,26 @@ def test_copy_button_reports_to_status_bar(qapp: QApplication) -> None:
     view.set_loaded_name("clip.mp4")
     view.btn_copy.click()
     assert w.statusBar().currentMessage() == "A: copied clip.mp4"
+
+    view.set_source_missing(True)
+    view.btn_copy.click()
+    assert w.statusBar().currentMessage() == "A: copied clip.mp4 (source still missing)"
+
+
+def test_seek_dispatch_exception_is_reported(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    _load_only(w, "a")
+
+    def boom(master: float, *, exact: bool = True) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(w._session, "seek_master_all_async", boom)
+    w._on_seek_committed(4.0)
+    assert not w._transport.exact_seek_pending
+    assert w.statusBar().currentMessage() == "Seek failed: boom"
 
 
 def test_auto_landscape_applies_to_loaded_views(
