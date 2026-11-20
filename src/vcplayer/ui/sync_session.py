@@ -133,6 +133,38 @@ class SyncSession:
             return None
         return 0.0, duration
 
+    def seek_range(self) -> tuple[float, float] | None:
+        """Interval for explicit seeks.
+
+        Synced pairs keep the common overlap so alignment is preserved.
+        Unsynced views may seek anywhere up to the longest loaded duration;
+        shorter views clamp to their own end.
+        """
+        if self.current_offsets():
+            return self.playable_range()
+        views = self._views()
+        master = views.get(self.master)
+        if master is None or not master.player.is_ready:
+            return None
+        duration = master.player.duration
+        if duration is None or not math.isfinite(duration) or duration <= 0:
+            return None
+        longest = duration
+        for view in views.values():
+            player = view.player
+            if not player.is_ready:
+                continue
+            view_duration = player.duration
+            if view_duration is not None and math.isfinite(view_duration):
+                longest = max(longest, view_duration)
+        return 0.0, longest
+
+    def _clamp_master_target(self, target: float) -> float:
+        duration = self.master_player.duration
+        if duration is None or not math.isfinite(duration) or duration <= 0:
+            return target
+        return min(max(target, 0.0), duration)
+
     def reference_fps(self) -> float:
         for eng in self.engines.values():
             if eng.ready:
@@ -141,52 +173,54 @@ class SyncSession:
 
     def seek_master_all(self, master: float, *, exact: bool = True) -> bool:
         """Seek the master once and every ready follower to one position."""
-        rng = self.playable_range()
+        rng = self.seek_range()
         if rng is None:
             return False
-        master = min(max(master, rng[0]), rng[1])
+        target = min(max(master, rng[0]), rng[1])
+        master_target = self._clamp_master_target(target)
         player = self.master_player
         if exact:
-            player.seek_exact(master)
+            player.seek_exact(master_target)
         else:
-            player.seek_fast(master)
+            player.seek_fast(master_target)
         for eng in self.engines.values():
             if eng.ready:
-                eng.seek_follower(master, exact=exact)
+                eng.seek_follower(target, exact=exact)
                 # A hard seek invalidates the EWMA the loop was built on.
                 eng.reset_runtime()
         return True
 
     def seek_master_all_async(self, master: float, *, exact: bool = True) -> list[AsyncSeek] | None:
         """Queue one seek per player; return futures and local targets."""
-        rng = self.playable_range()
+        rng = self.seek_range()
         if rng is None:
             return None
-        master = min(max(master, rng[0]), rng[1])
+        target = min(max(master, rng[0]), rng[1])
+        master_target = self._clamp_master_target(target)
         seeks: list[AsyncSeek] = []
         player = self.master_player
         method = getattr(player, "seek_exact_async" if exact else "seek_fast_async", None)
         if callable(method):
-            future = method(master)
+            future = method(master_target)
             if future is None:
                 return None
-            seeks.append(AsyncSeek(self.master, future, master))
+            seeks.append(AsyncSeek(self.master, future, master_target))
         else:
             if exact:
-                player.seek_exact(master)
+                player.seek_exact(master_target)
             else:
-                player.seek_fast(master)
-            seeks.append(AsyncSeek(self.master, _completed_future(), master))
+                player.seek_fast(master_target)
+            seeks.append(AsyncSeek(self.master, _completed_future(), master_target))
         for vid, eng in self.engines.items():
             if not eng.ready:
                 continue
             try:
-                target = eng.follower_target(master)
-                future = eng.seek_follower_async(master, exact=exact)
+                follower_target = eng.follower_target(target)
+                future = eng.seek_follower_async(target, exact=exact)
             except Exception as exc:  # one broken follower must not drop the batch
                 logger.warning("view %s async seek failed: %s", vid, exc)
                 continue
-            seeks.append(AsyncSeek(vid, future, target))
+            seeks.append(AsyncSeek(vid, future, follower_target))
             # A hard seek invalidates the EWMA the loop was built on.
             eng.reset_runtime()
         return seeks or None

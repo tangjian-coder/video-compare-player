@@ -141,6 +141,9 @@ class SessionController:
     def playable_range(self) -> tuple[float, float] | None:
         return self._sync.playable_range()
 
+    def seek_range(self) -> tuple[float, float] | None:
+        return self._sync.seek_range()
+
     def reference_fps(self) -> float:
         return self._sync.reference_fps()
 

@@ -1180,7 +1180,7 @@ class MainWindow(QMainWindow):
         self._update_ui_rate()
 
     def _clamp_master_time(self, t: float) -> float:
-        rng = self._transport.playable_range()
+        rng = self._transport.seek_range()
         return t if rng is None else min(max(t, rng[0]), rng[1])
 
     def _on_scrub_preview(self, t: float) -> None:

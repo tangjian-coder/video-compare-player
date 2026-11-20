@@ -88,6 +88,9 @@ class TransportController:
     def playable_range(self) -> tuple[float, float] | None:
         return self._session.playable_range()
 
+    def seek_range(self) -> tuple[float, float] | None:
+        return self._session.seek_range()
+
     def effective_playing(self) -> bool:
         """Playback state the global button should display.
 
@@ -251,7 +254,7 @@ class TransportController:
         return True
 
     def _commit_seek(self, target: float) -> bool:
-        rng = self.playable_range()
+        rng = self.seek_range()
         if rng is not None:
             target = min(max(target, rng[0]), rng[1])
         self._cancel_preview_state()
@@ -559,7 +562,7 @@ class TransportController:
         self._commit_from = {}
         self._commit_token = -1
         self._play_after_seek = False
-        rng = self.playable_range()
+        rng = self.seek_range()
         if rng is not None:
             t = min(max(t, rng[0]), rng[1])
         self._preview_target = t

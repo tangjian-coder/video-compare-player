@@ -114,6 +114,42 @@ def test_playable_range_prefers_ready_pair_intersection() -> None:
     assert a.is_ready and b.is_ready
 
 
+def test_seek_range_unsynced_uses_longest_ready_duration() -> None:
+    session, _a, b = make_session()
+    b.duration = 30.0
+    assert session.seek_range() == (0.0, 30.0)
+    assert session.playable_range() == (0.0, 10.0)
+
+
+def test_seek_master_all_unsynced_clamps_short_views_to_own_end() -> None:
+    session, a, b = make_session()
+    b.duration = 30.0
+    assert session.seek_master_all(25.0)
+    assert a.seeks == [10.0]
+    assert b.seeks == [25.0]
+
+
+def test_seek_master_all_async_unsynced_records_per_view_targets() -> None:
+    session, a, b = make_session()
+    b.duration = 30.0
+    seeks = session.seek_master_all_async(25.0)
+    assert seeks is not None
+    assert {seek.view: seek.target for seek in seeks} == {"a": 10.0, "b": 25.0}
+    assert a.seeks == [10.0]
+    assert b.seeks == [25.0]
+
+
+def test_seek_range_synced_keeps_pair_intersection() -> None:
+    session, a, b = make_session()
+    b.duration = 30.0
+    session.engines["b"].state.point_a = 0.0
+    session.engines["b"].state.point_b = 0.0
+    assert session.seek_range() == (0.0, 10.0)
+    assert session.seek_master_all(25.0)
+    assert a.seeks == [10.0]
+    assert b.seeks == [10.0]
+
+
 def test_playable_range_rejects_zero_width_pair() -> None:
     session, a, b = make_session()
     b.duration = 3.0

@@ -655,6 +655,23 @@ def test_seek_target_is_clamped_before_virtual_step(qapp: QApplication) -> None:
     w._on_ui_tick()
 
 
+def test_unsynced_long_track_seek_clamps_short_master_to_end(qapp: QApplication) -> None:
+    w = make_window(qapp, n=2)
+    w._session.rebuild()
+    p = _load_only(w, "a")
+    p["b"].meta = object()
+    p["b"].duration = 30.0
+    p["b"].time_pos = 0.0
+    w.views["b"].set_loaded_name("b.mp4")
+    w._session.rebuild()
+
+    assert w._transport.seek_range() == (0.0, 30.0)
+    w._on_seek_committed(25.0)
+    assert p["a"].seeks == [10.0]
+    assert p["b"].seeks == [25.0]
+    assert w._transport._commit_target == pytest.approx(10.0)
+
+
 def test_single_frame_step_waits_for_position_change(qapp: QApplication) -> None:
     w = make_window(qapp, n=2)
     w._session.rebuild()
@@ -1020,11 +1037,28 @@ def test_seek_master_all_clamps_to_common_range(qapp: QApplication) -> None:
     p["a"].meta = p["b"].meta = p["c"].meta = object()
     w._session.add_follower("b")
     w._session.add_follower("c")
+    for vid in ("b", "c"):
+        engine = w._session.engines[vid]
+        engine.state.point_a = 0.0
+        engine.state.point_b = 0.0
     w._seek_master_all(70.0)  # beyond b's 50s: the common range is (0, 50)
     # Every view lands on the same clamped master; A is seeked exactly once.
     assert p["a"].seeks == [50.0]
     assert p["b"].seeks == [50.0]
     assert p["c"].seeks == [50.0]
+
+
+def test_seek_master_all_unsynced_keeps_long_target(qapp: QApplication) -> None:
+    w = make_window(qapp, n=3)
+    p = _players(w)
+    p["a"].duration, p["b"].duration, p["c"].duration = 100.0, 50.0, 80.0
+    p["a"].meta = p["b"].meta = p["c"].meta = object()
+    w._session.add_follower("b")
+    w._session.add_follower("c")
+    w._seek_master_all(80.0)
+    assert p["a"].seeks == [80.0]
+    assert p["b"].seeks == [50.0]
+    assert p["c"].seeks == [80.0]
 
 
 def test_seek_master_all_without_common_range_does_not_seek(
