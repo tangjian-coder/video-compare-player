@@ -1,100 +1,101 @@
 # video-compare-player
 
-多视图视频同步对比播放器（1–4 视图动态切换）。为运动分析场景设计：**HLG/Dolby HDR、120fps 高帧率、高码率原片直接播放**（libmpv 硬件解码），无需预转码。
-
-当前版本：**v1.4.1**（2026-11-04）
-
-## 功能（v1.4）
-
-- **1–4 视图同步对比**：默认双视图，`＋` / `V` 键追加、`－` 移除（最多 4 块）；`Layout` → `Single (close others)` 只保留 A 并卸载其他窗格视频；布局预设只按当前视图数量显示，单视图时 `Layout` 禁用
-- **即时交互反馈**：视频打开立即显示 Opening 状态；时间轴拖动/点击先移动旋钮，异步 seek 不阻塞界面；暂停时自动降低 UI 刷新频率
-- **拖动标题栏自由排列窗格**：拖到另一窗格边缘＝插入该行/新行，拖到中心＝交换；4 视图默认 2×2，标题栏右键可选 1×4 / 2×2 / 3+1 等预设，也可重置布局
-- **清空视频**：每个窗格标题栏右侧 `×` 卸载该窗格视频；清空当前参考视图时自动把下一个已加载视图设为参考；`Open ▾` → `Clear all videos` 一键全清并清除同步
-- **源文件缺失检测**：播放中源文件被资源管理器删除或改名时，暂停全部视图并在窗格标记 `missing`；重新加载或清空该窗格前，播放/seek/Align 会被阻止
-- 同步点校准：在各视图中标记"同一物理瞬间"（A 为默认参考视图，每个跟随视图与参考视图各一对偏移），一键对齐全部
-- 缩放/平移/旋转：默认操作**所有视图联动**（滚轮缩放各走一档、拖拽像素级 1:1 平移、双击复位），**Ctrl+操作仅作用于本侧**；每侧 `↻` 按钮顺时针旋转 90°
-- **自动横屏**：工具栏横屏按钮开启后，当前和以后打开的视频统一按横屏显示：竖屏视频（含手机 rotation metadata）转 90°，横屏视频保持 0°。关闭只影响以后打开的视频，当前画面不改变；之后新打开的视频从原始方向开始，不再继承上一次的旋转。状态会记入设置
-- **一键录屏**：`F9` 把所有视频区（含标题栏与各侧控制条，不含时间轴/走带栏/状态栏）录成 mp4，对齐后同步播放的演示素材直接可发（自动选档：NVENC 硬编 60fps → 桌面复制+x264 → gdigrab+x264）
-- **十字准星**：`C` 在每个视图**窗格中心**显示一条 **1px 红色十字线**（mpv OSD 渲染），缩放/平移/旋转时**纹丝不动**——这是对比运动幅度的稳定参照物，会被录进录屏
-- **macOS 深色视觉**：内置 Inter 字体、矢量图标、分组传输栏、卡片式时间轴与深色原生标题栏；拖拽窗格有独立拖影与插入线，窗格与时间轴悬停联动高亮
-- 拖放加载，支持命令行直接传 1–4 个视频
+Windows 上的多路视频对比播放器。最多同时打开 4 个视频，支持逐帧对齐、同步播放、缩放平移和录屏，适合运动分析和多版本画面对比。底层使用 libmpv 与 PySide6。
 
 ## 运行
 
-```powershell
-# 方式 1：脚本（可带 1–4 个视频路径）
-.\scripts\run.ps1 a.mp4 b.mp4            # 2 视图
-.\scripts\run.ps1 a.mp4 b.mp4 c.mp4 d.mp4  # 直接 4 视图
+需要 Windows 10 1809 或更新版本、Python 3.12+。
 
-# 方式 2：直接运行
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+本项目依赖 `vendor\libmpv-2.dll`，该文件不包含在 Git 仓库中。请从 [mpv Windows builds](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/) 下载开发包，将 DLL 放到 `vendor\` 目录。
+
+```powershell
+# 不带视频启动
+.\scripts\run.ps1
+
+# 启动时加载 1–4 个视频
+.\scripts\run.ps1 a.mp4 b.mp4
+.\scripts\run.ps1 a.mp4 b.mp4 c.mp4 d.mp4
+```
+
+也可以直接运行：
+
+```powershell
 .\.venv\Scripts\python.exe -m vcplayer a.mp4 b.mp4
 ```
 
-## 打包
+## 快速上手
+
+1. 把视频拖进窗格。一次拖入多个文件会自动补足视图，最多 4 个。
+2. 用每个窗格底部的 `<` / `>` 找到同一物理瞬间，按 `S` 对齐。
+3. 按 `Space` 同步播放；点击或拖动时间轴跳转。
+
+未对齐时，各视图只是同时起播，不建立时间偏移。对齐后，播放、逐帧和 seek 都按同步偏移执行。详细操作见 [操作手册](docs/controls-guide.md)。
+
+## 主要功能
+
+- **1–4 路视频对比**：窗格可增删、交换和自由排列，提供并排、堆叠、2×2 等布局。
+- **同步与逐帧**：为每个视图设置同步锚点，播放时显示偏移和漂移；支持逐帧、变速、快速预览 seek 和松手精确 seek。
+- **多轨时间轴**：每个视图一条轨道，黄色菱形标记同步锚点；未同步时可跳到长视频任意位置，短视频超出自身时长时停在末尾。
+- **缩放、平移和旋转**：默认联动所有视图，按住 `Ctrl` 只操作当前视图；支持竖屏视频自动转横屏，包含手机 rotation metadata。
+- **录屏和准星**：`F9` 把视频区域录成 MP4；`C` 显示固定在窗格中心的十字准星。
+- **原片播放**：支持高码率、高帧率和 HDR 视频，硬解效果取决于显卡、驱动和编码格式。
+- **其他**：批量拖入、复制文件名、异步加载、源文件被移动或删除时暂停并标记。
+
+## 常用操作
+
+| 按键 | 功能 |
+| --- | --- |
+| `Space` | 播放 / 暂停 |
+| `←` / `→` | 所有视图逐帧后退 / 前进 |
+| `↑` / `↓` | 调整播放速度 |
+| `Home` / `End` | 跳到对齐区间首尾 |
+| `S` | 对齐各视图当前帧 |
+| `R` | 清除同步 |
+| `V` | 追加视图 |
+| `F9` | 开始 / 停止录屏 |
+| `C` | 切换十字准星 |
+| `Ctrl+O` | 为当前活动视图打开视频 |
+
+| 鼠标操作 | 默认 | 按住 `Ctrl` |
+| --- | --- | --- |
+| 滚轮 | 所有视图联动缩放 | 只缩放当前视图 |
+| 左键拖拽 | 所有视图联动平移 | 只平移当前视图 |
+| 双击 | 所有视图复位 | 只复位当前视图 |
+
+拖动窗格标题栏可以重排；标题栏右侧可复制文件名或清空视频。完整快捷键、布局和录屏说明见 [操作手册](docs/controls-guide.md)。
+
+## 打包 Windows exe
 
 ```powershell
-# 默认：单文件版，便于分发
+# 单文件版
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 
-# 可选：文件夹版
+# 文件夹版
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -OneDir
 ```
 
-默认产出 `dist\vcplayer.exe`（约 118 MB，已内嵌 libmpv 与图标，版本号 **1.4.1**）；`-OneDir` 产出 `dist\vcplayer\vcplayer.exe` 文件夹。单文件版每次启动需先解压，实际冷启动时间受文件系统和杀软扫描影响很大；`--perf` 从 Python 入口开始计时，不包含 PyInstaller 解压阶段。两者运行环境均为 Windows 10 1809+。配置与日志写入 `%LOCALAPPDATA%\vcplayer\`。exe 未签名，个别杀软可能误报需手动放行。固定到任务栏的 `.lnk` 建议运行 `scripts\set_aumid.py` 写入 AUMID，避免图标/分组退化。
+默认输出 `dist\vcplayer.exe`，文件夹版输出到 `dist\vcplayer\`。打包会内嵌 libmpv、ffmpeg 和图标。
 
-## 界面布局
-
-窗格排列：`Layout` → `Single (close others)` 只保留 A；布局预设只按当前视图数量提供，单视图时 `Layout` 禁用，增加视图请用 `＋` / `V`。2 视图默认并排，3 视图一行，4 视图默认 **2×2**。**拖动任意窗格标题栏**到另一窗格边缘（左/右＝同行插入，上/下＝新行）或中心（交换）即可重排；标题栏右键有布局预设与"重置布局"。视图身份（A/B/C/D）不随位置变化，参考视图默认是 A；清空参考视图时会自动提升下一个已加载视图。
-
-1–4 个独立视频块（Kinovea 双屏风格）：每块含标题栏（A/B/C/D 徽章 + 文件名 + 复制文件名按钮，蓝/绿/靛蓝/橙）、视频区、底部控制条（本侧播放、逐帧 `<` `>`、旋转、缩放读数 + 时间读数）。下方是共享传输栏（文件与视图 ＋－ / 走带 / 速度与同步）和状态栏（参考视图时间 / 各对 offset / 实时漂移 / 帧率）。**`V` 键或 `＋` 追加视图；`－` 移除最后添加的视图并卸载其视频（仅 A 常驻）**。
-
-**同步校准**：用各块底部的 `<` `>` 把每个视图各自走到同一物理瞬间（如秒表刚跳到 `05.00` 的帧）→ 点 `Align` 或按 `S` → 完成。按 `R` 或点 `Unsync` 只清除同步，不卸载视频。详见操作手册。
-
-## 快捷键
-
-`Space` 同步播放/暂停 · `←`/`→` 全视图逐帧 · `↑`/`↓` 变速 · `Home`/`End` 跳对齐区间首尾 · `S` 一键对齐 · `R` 清除同步 · `F9` 录屏开始/停止 · `C` 十字准星 · `V` 追加视图 · `Ctrl+O` 打开视频（蓝色边框的活动窗格）
-
-完整快捷键、时间轴与状态栏的详细说明见 **`docs\controls-guide.md`（操作手册）**。
-
-视频文件直接**拖进任意视频块**即可加载（空块显示拖放提示）。一次选中多个视频拖入时，会自动补足视图（最多 4 个），从落点窗格开始按顺序循环填入并替换已有视频；超出 4 个的文件会忽略。
-
-## 鼠标手势（视频区）
-
-| 手势 | 默认（所有视图联动） | Ctrl（仅本侧） |
-| :--- | :--- | :--- |
-| 滚轮 | 缩放：各自在档位上前进/后退一档（1.0–8.0，保留各侧倍率差） | 本侧缩放 |
-| 左键拖拽 | 平移：像素级 1:1 跟随鼠标，各自边缘钳制 | 本侧平移 |
-| 双击 | 复位缩放、平移和旋转 | 本侧复位 |
-
-每块底部 Play 旁的 `↻` 按钮＝本侧顺时针旋转 90°（循环 0→90→180→270，旋转时平移回中、缩放保留），当前角度显示在按钮右侧的等宽读数里（0° 时隐藏但保留位置）；缩放倍率 `×2.4` 显示在时间读数旁。
+单文件版启动时需要先解压，冷启动时间受磁盘和杀毒软件影响。exe 未签名，Windows 可能弹出安全提示。配置和日志写入 `%LOCALAPPDATA%\vcplayer\`。
 
 ## 开发
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest      # 单测
-.\.venv\Scripts\ruff.exe check src tests  # lint
-.\.venv\Scripts\mypy.exe                  # 类型检查
-.\.venv\Scripts\python.exe scripts\probe_decode.py  # 无头解码验证
-.\.venv\Scripts\python.exe -m vcplayer --perf      # 交互性能日志
+# 安装开发依赖
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+
+# 测试与静态检查
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check src tests
+.\.venv\Scripts\python.exe -m mypy src
+
+# 输出交互性能日志
+.\.venv\Scripts\python.exe -m vcplayer --perf
 ```
 
-## 结构
-
-```
-src\vcplayer\
-├── core\    models.py / player.py（libmpv 封装）/ sync.py（同步引擎）/ recorder.py（录屏）
-├── ui\      main_window.py（组合根）/ session_controller.py（视图与参考策略）/ transport_controller.py（播放编排）/ load_coordinator.py（异步加载）/ source_monitor.py（源文件缺失监控）/ video_view.py（窗格+原生表面）/ view_host.py（网格布局）/ view_set.py（视图注册表）/ recording_controller.py（录屏会话）/ sync_session.py（同步会话）/ status_presenter.py（状态格式化）
-│            layout.py（纯布局模型）/ timeline.py（多轨时间轴）/ perf_monitor.py（UI 卡顿监控）/ style.py + theme.py（主题）
-│            icons.py（矢量图标）/ widgets.py / pane_drag.py（拖放编解码）/ win_chrome.py
-├── app.py / __main__.py / config.py / perf.py
-tests\       core 纯逻辑 + 布局/时间轴数学 + offscreen UI 测试（FakePlayer，无真实 mpv）
-vendor\      libmpv-2.dll（mpv v0.41，硬解 + HDR）
-docs\        操作手册；2026-08-21 设计文档为 v1 历史背景
-```
-
-设计决策见 `docs\2026-08-21-video-compare-player-design.md`（v1 历史；当前行为以 README 与操作手册为准）。
-
-## 环境要求
-
-- Windows 10/11，Python 3.12+（`.venv` 已建好）
-- `vendor\libmpv-2.dll` 必须存在（重新部署时从 mpv-dev 包提取：https://sourceforge.net/projects/mpv-player-windows/files/libmpv/）
+界面和同步行为以 [操作手册](docs/controls-guide.md) 为准；早期设计背景见 [设计文档](docs/2026-08-21-video-compare-player-design.md)。
